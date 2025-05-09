@@ -2,7 +2,6 @@ const Event = require("../models/Event");
 const fs = require("fs");
 const sharp = require("sharp");
 
-// Obtener todos los eventos
 const getAllEvents = async (req, res) => {
   try {
     const events = await Event.find();
@@ -12,7 +11,6 @@ const getAllEvents = async (req, res) => {
   }
 };
 
-// Crear un nuevo evento
 const createEvent = async (req, res) => {
   try {
     console.log("📩 Datos recibidos en el backend:", req.body);
@@ -20,11 +18,9 @@ const createEvent = async (req, res) => {
 
     let { age, price, categories } = req.body;
 
-    // 🔹 Convertir valores numéricos (porque FormData los envía como strings)
     age = age ? parseInt(age) : null;
     price = price ? parseFloat(price) : null;
 
-    // 🔹 Asegurar que `categories` sea un array
     let parsedCategories = categories;
     if (typeof categories === "string") {
       try {
@@ -53,7 +49,7 @@ const createEvent = async (req, res) => {
       age,
       dressCode: req.body.dressCode,
       price,
-      categories: parsedCategories, // Guardar correctamente el array
+      categories: parsedCategories,
       createdBy: req.user.id,
       image: req.file ? req.file.path : null,
     });
@@ -70,37 +66,3 @@ module.exports = {
   getAllEvents,
   createEvent,
 };
-
-/*const Event = require("../models/Event");
-
-// Controlador para obtener todos los eventos
-const getAllEvents = async (req, res) => {
-  try {
-    const events = await Event.find();
-    res.json(events);
-  } catch (err) {
-    res.status(500).json({ message: "Error al obtener los eventos" });
-  }
-};
-
-// Controlador para crear un nuevo evento
-const createEvent = async (req, res) => {
-  const { title, description, date } = req.body;
-  const newEvent = new Event({
-    title,
-    description,
-    date,
-  });
-
-  try {
-    const savedEvent = await newEvent.save();
-    res.status(201).json(savedEvent);
-  } catch (err) {
-    res.status(400).json({ message: "Error al crear el evento" });
-  }
-};
-
-module.exports = {
-  getAllEvents,
-  createEvent,
-};*/
