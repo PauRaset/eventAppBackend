@@ -5,9 +5,8 @@ const sharp = require("sharp");
 const fs = require("fs");
 const router = express.Router();
 const Event = require("../models/Event");
-const authenticateToken = require("../middlewares/authMiddleware"); // Middleware de autenticación
+const authenticateToken = require("../middlewares/authMiddleware"); 
 
-// Configurar multer para subir archivos a la carpeta "uploads"
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
     cb(null, "uploads/");
@@ -19,7 +18,6 @@ const storage = multer.diskStorage({
 
 const upload = multer({ storage });
 
-// Endpoint para crear un nuevo evento con autenticación
 router.post(
   "/",
   authenticateToken,
@@ -33,7 +31,7 @@ router.post(
         city,
         street,
         postalCode,
-        categories, // Asegurar que las categorías se procesen correctamente
+        categories, 
         age,
         dressCode,
         price,
@@ -56,7 +54,6 @@ router.post(
         fs.unlinkSync(req.file.path);
       }
 
-      // 🔹 Convertir `categories` en un array si es un string
       let parsedCategories = categories;
       if (typeof categories === "string") {
         try {
@@ -80,7 +77,7 @@ router.post(
         street,
         postalCode,
         image,
-        categories: parsedCategories, // Guardar como array real
+        categories: parsedCategories, 
         age,
         dressCode,
         price,
@@ -105,7 +102,6 @@ router.get("/", async (req, res) => {
       "username email profilePicture",
     );
 
-    // Formatear las categorías correctamente antes de enviarlas al frontend
     const formattedEvents = events.map((event) => ({
       ...event.toObject(),
       categories: Array.isArray(event.categories)
@@ -122,8 +118,6 @@ router.get("/", async (req, res) => {
   }
 });
 
-// 🔹 Endpoint para obtener los detalles de un evento por su ID con `isOwner`
-/*router.get("/:id", authenticateToken, async (req, res) => {*/
 router.get("/:id", async (req, res) => {
   const { id } = req.params;
   try {
@@ -135,7 +129,6 @@ router.get("/:id", async (req, res) => {
       return res.status(404).json({ message: "Evento no encontrado" });
     }
 
-    // Asegurar que categories sea un array real
     const formattedEvent = {
       ...event.toObject(),
       categories: Array.isArray(event.categories)
@@ -145,7 +138,6 @@ router.get("/:id", async (req, res) => {
         : [],
     };
 
-    // Obtener el usuario autenticado (si está autenticado)
     const userId = req.user ? req.user.id : null;
     const isOwner = userId && event.createdBy._id.toString() === userId;
 
@@ -156,10 +148,9 @@ router.get("/:id", async (req, res) => {
   }
 });
 
-// Endpoint para eliminar un evento (solo el creador puede eliminarlo)
 router.delete("/:id", authenticateToken, async (req, res) => {
   try {
-    const event = await Event.findById(req.params.id); // ✅ Definir event primero
+    const event = await Event.findById(req.params.id); 
 
     if (!event) {
       return res.status(404).json({ message: "Evento no encontrado" });
@@ -179,7 +170,6 @@ router.delete("/:id", authenticateToken, async (req, res) => {
   }
 });
 
-// Endpoint para alternar asistencia a un evento
 router.post("/:id/attend", authenticateToken, async (req, res) => {
   try {
     const event = await Event.findById(req.params.id);
@@ -189,7 +179,6 @@ router.post("/:id/attend", authenticateToken, async (req, res) => {
 
     const userId = req.user.id;
 
-    // Alternar asistencia
     const userIndex = event.attendees.indexOf(userId);
     if (userIndex !== -1) {
       event.attendees.splice(userIndex, 1);
@@ -206,30 +195,3 @@ router.post("/:id/attend", authenticateToken, async (req, res) => {
 });
 
 module.exports = router;
-
-/*
-router.delete("/:id", authenticateToken, async (req, res) => {
-  try {
-    console.log("ID del usuario autenticado:", req.user.id);
-    console.log("ID del creador del evento:", event.createdBy.toString());
-
-    const event = await Event.findById(req.params.id);
-    if (!event) {
-      return res.status(404).json({ message: "Evento no encontrado" });
-    }
-
-    // Verificar si el usuario autenticado es el creador del evento
-    if (event.createdBy.toString() !== req.user.id) {
-      return res
-        .status(403)
-        .json({ message: "No tienes permiso para eliminar este evento" });
-    }
-
-    await Event.findByIdAndDelete(req.params.id);
-    res.json({ message: "Evento eliminado correctamente" });
-  } catch (error) {
-    console.error("Error al eliminar el evento:", error);
-    res.status(500).json({ message: "Error interno del servidor" });
-  }
-});
-*/
