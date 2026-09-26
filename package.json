@@ -5,24 +5,38 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
+    "seed:promos": "node scripts/seedPromotionTemplates.js",
+    "seed:promos:dry": "node scripts/seedPromotionTemplates.js --dry-run",
+    "seed:promos:force": "node scripts/seedPromotionTemplates.js --force",
+    "geocode:events": "node scripts/geocodeExistingEvents.js",
+    "geocode:events:dry": "node scripts/geocodeExistingEvents.js --dry-run",
+    "reconcile:reservations": "node scripts/reconcileReservations.js",
+    "reconcile:reservations:dry": "node scripts/reconcileReservations.js --dry-run",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@sendgrid/mail": "^8.1.6",
     "bcrypt": "^5.1.1",
     "bcryptjs": "^2.4.3",
     "cors": "^2.8.5",
-    "dotenv": "^8.2.0",
+    "dotenv": "^8.6.0",
     "express": "^4.17.1",
+    "express-rate-limit": "^8.2.1",
     "express-session": "^1.18.1",
+    "firebase-admin": "^13.5.0",
+    "helmet": "^8.1.0",
     "jsonwebtoken": "^8.5.1",
     "mongoose": "^5.12.3",
     "multer": "^1.4.5-lts.1",
     "passport": "^0.7.0",
     "passport-facebook": "^3.0.0",
     "passport-instagram": "^1.0.0",
-    "sharp": "^0.33.5"
+    "pdfkit": "^0.17.1",
+    "qrcode": "^1.5.4",
+    "sharp": "^0.33.5",
+    "stripe": "^19.1.0"
   }
 }

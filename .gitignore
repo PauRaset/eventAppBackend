@@ -1,0 +1,27 @@
+# Secretos — NUNCA subir
+.env
+.env.*
+aenv
+arxiuenv
+firebase-service-account.json
+nvfirebase.json
+nightvibe-62942-firebase-adminsdk-fbsvc-2727b3d3c0.json
+
+# Dependencias
+node_modules/
+
+# Archivos subidos por usuarios (no son código)
+uploads/*
+!uploads/multerConfig.js
+
+# Copias de seguridad manuales
+*_copia*.js
+*_Copia*.js
+index_copia.js
+index_copia2.js
+package_copia.js
+borrar/
+
+# Sistema
+.DS_Store
+*.log
