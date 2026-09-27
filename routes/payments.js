@@ -202,6 +202,46 @@ function stripeProductName(event, tier) {
   return tier ? `${baseTitle} · ${tier.name}` : baseTitle;
 }
 
+/**
+ * Paso 3b de la resolución del club (compartido por /direct y /checkout).
+ * El club puede tener ownerUserId guardado como EMAIL en vez de como
+ * ObjectId (así lo guarda el registro del portal). Buscamos por el email
+ * del usuario propietario. Devuelve el club (lean) o null.
+ *
+ * Autorreparación: si lo encuentra así, guarda event.club = Club._id para que
+ * la próxima compra entre por el paso 1 (Club.findById(event.club)).
+ * NO toca event.clubId: sigue siendo el _id del User, que es lo que usan
+ * /mine, las promociones y referralAnalytics (/club/:clubId/event/:eventId).
+ */
+async function findClubByOwnerEmail(event, logTag) {
+  const ownerUserId = event.createdBy || event.clubId || event.organizerId || null;
+  if (!ownerUserId) return null;
+
+  const ownerUser = await User.findById(ownerUserId).lean();
+  const rawEmail = (ownerUser?.email || '').trim();
+  const ownerEmail = rawEmail.toLowerCase();
+  if (!ownerEmail) return null;
+
+  const club = await Club.findOne({
+    ownerUserId: { $in: [...new Set([ownerEmail, rawEmail])] },
+  }).lean();
+  if (!club) return null;
+
+  console.log(`[${logTag}] club resuelto por EMAIL del propietario:`, {
+    eventId: String(event._id),
+    clubId: String(club._id),
+    ownerEmail,
+  });
+
+  try {
+    await Event.updateOne({ _id: event._id }, { $set: { club: club._id } });
+    console.log(`[${logTag}] evento reparado: club ->`, String(club._id));
+  } catch (repairErr) {
+    console.warn(`[${logTag}] no se pudo reparar el vínculo:`, repairErr.message);
+  }
+  return club;
+}
+
 /* ---------- Página "Entradas agotadas" para /direct (navegador) ---------- */
 
 function escapeHtml(s) {
@@ -368,6 +408,14 @@ router.get('/direct/:eventId', async (req, res) => {
           return res.status(400).send('El evento no tiene club asociado.');
         }
         club = await Club.findOne({ ownerUserId }).lean();
+        if (club) clubId = club._id;
+      }
+
+      // 3b) El club puede tener ownerUserId guardado como EMAIL en vez de como
+      // ObjectId (así lo guarda el registro del portal). Buscamos por el email
+      // del usuario propietario y reparamos event.club (ver findClubByOwnerEmail).
+      if (!club) {
+        club = await findClubByOwnerEmail(event, 'direct');
         if (club) clubId = club._id;
       }
 
@@ -671,6 +719,11 @@ async function resolveStripeClub(event) {
     const ownerUserId = event.createdBy || event.clubId || event.organizerId || null;
     if (!ownerUserId) return { error: 'El evento no tiene club asociado.' };
     club = await Club.findOne({ ownerUserId }).lean();
+    if (club) clubId = club._id;
+  }
+  // 3b) Club con ownerUserId = email del propietario
+  if (!club) {
+    club = await findClubByOwnerEmail(event, 'checkout');
     if (club) clubId = club._id;
   }
   if (!club || !club.stripeAccountId) {
