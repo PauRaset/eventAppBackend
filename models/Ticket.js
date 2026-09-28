@@ -14,4 +14,8 @@ const TicketSchema = new mongoose.Schema({
   checkedInBy: { type: String, default: null }
 }, { timestamps: true });
 
+// "Mis entradas": búsquedas por propietario y por email del comprador
+TicketSchema.index({ ownerUserId: 1, createdAt: -1 });
+TicketSchema.index({ email: 1, createdAt: -1 });
+
 module.exports = mongoose.model('Ticket', TicketSchema);
