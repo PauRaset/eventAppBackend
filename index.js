@@ -75,6 +75,10 @@ if (process.env.NODE_ENV === 'production') {
   }
 }
 
+// Rutas de diagnóstico. Desactivadas salvo que se activen explícitamente.
+const DEBUG_ROUTES_ENABLED = process.env.ENABLE_DEBUG_ROUTES === 'true';
+console.log('Debug routes:', DEBUG_ROUTES_ENABLED ? 'ACTIVADAS' : 'desactivadas');
+
 // ===== Stripe =====
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: "2024-06-20" });
 
@@ -166,7 +170,7 @@ app.use(cors(corsOptions));
 // Responder preflight explícitamente con la MISMA config
 app.options("*", cors(corsOptions));
 // DEBUG temporal: ver headers y si llega Authorization/Cookie
-if (process.env.NODE_ENV !== 'production') {
+if (DEBUG_ROUTES_ENABLED) {
   app.all('/api/debug/echo', (req, res) => {
     res.json({
       method: req.method,
@@ -224,7 +228,7 @@ const stripeWebhooksRouter = require('./routes/stripeWebhooks');
 app.use('/api/webhooks/stripe', stripeWebhooksRouter);
 
 
-if (process.env.NODE_ENV !== 'production') {
+if (DEBUG_ROUTES_ENABLED) {
   // === DEBUG: ver estado de una Checkout Session (y su PI) ===
   app.get("/api/debug/checkout-session/:sid", async (req, res) => {
     try {
@@ -333,7 +337,7 @@ app.get('/api/auth/me', anyAuthWithId, (req, res) => {
 });
 
 // ===== DEBUG Firebase: verifica un ID token (solo en desarrollo) =====
-if (process.env.NODE_ENV !== 'production') {
+if (DEBUG_ROUTES_ENABLED) {
   app.get('/api/debug/verify-token', async (req, res) => {
     try {
       const h = req.headers.authorization || '';
@@ -893,6 +897,7 @@ if (referralAnalyticsRoutes) {
   console.warn('⚠️ /api/referrals NO montado (referralAnalyticsRoutes=null).');
 }
 
+if (DEBUG_ROUTES_ENABLED) {
 // ===== DEBUG: enviar email de prueba con QR =====
 app.post('/api/debug/send-test-email', express.json(), async (req, res) => {
   try {
@@ -1002,6 +1007,7 @@ app.post('/api/debug/resend-ticket', express.json(), async (req, res) => {
     return res.status(500).json({ error: 'resend_failed', message: e?.message || 'unknown' });
   }
 });
+} // fin DEBUG_ROUTES_ENABLED (send-test-email, resend-ticket)
 
 // ===== 404 =====
 app.use((_req, res) => res.status(404).send("Ruta no encontrada"));
