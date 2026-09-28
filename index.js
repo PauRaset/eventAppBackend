@@ -223,210 +223,6 @@ if (!STRIPE_WEBHOOK_SECRET_CONNECT) {
 const stripeWebhooksRouter = require('./routes/stripeWebhooks');
 app.use('/api/webhooks/stripe', stripeWebhooksRouter);
 
-/*app.post(
-  "/api/webhooks/stripe",
-  bodyParser.raw({ type: "application/json" }),
-  async (req, res) => {
-    const sig = req.headers["stripe-signature"];
-    let event;
-
-    try {
-      event = stripe.webhooks.constructEvent(
-        req.body,
-        sig,
-        process.env.STRIPE_WEBHOOK_SECRET
-      );
-    } catch (err) {
-      console.error("❌ Webhook signature failed:", err.message);
-      return res.status(400).send(`Webhook Error: ${err.message}`);
-    }
-
-    // ===== EMISIÓN DE TICKETS + EMAIL =====
-    if (event.type === "checkout.session.completed") {
-      const sessionObj = event.data.object;
-      console.log(
-        "✅ Pago OK:",
-        sessionObj.id,
-        "email:",
-        sessionObj.customer_details?.email
-      );
-
-      try {
-        // 1) Datos base del pago (desde la Session)
-        const email  = sessionObj.customer_details?.email || null;
-        const name   = sessionObj.customer_details?.name  || "";
-        const eventId = sessionObj.metadata?.eventId || "EVT";
-        const clubId  = sessionObj.metadata?.clubId || null;
-        const userId  = sessionObj.metadata?.userId || null;
-        const phone   = sessionObj.metadata?.phone  || null;
-        const paymentIntentId = sessionObj.payment_intent || null;
-
-        // 2) Recuperar line items reales
-        const lineItems = await stripe.checkout.sessions.listLineItems(
-          sessionObj.id,
-          { limit: 100 }
-        );
-
-        // Calcular subtotal y moneda (a partir del primer item)
-        let subtotalCents = 0;
-        let currency = "eur";
-        for (const li of lineItems.data) {
-          const qty = li.quantity || 1;
-          const unit = li.amount_total
-            ? Math.floor(li.amount_total / qty)
-            : li.price?.unit_amount || 0;
-          subtotalCents += unit * qty;
-          currency = (li.price?.currency || currency || "eur").toLowerCase();
-        }
-
-        // 3) Opcional: recuperar PaymentIntent para capturar application_fee y destino Connect
-        let applicationFeeCents = 0;
-        let destinationAccount = null;
-        let chargeId = null;
-        let balanceTxId = null;
-
-        if (paymentIntentId) {
-          try {
-            const pi = await stripe.paymentIntents.retrieve(paymentIntentId, {
-              expand: ["latest_charge", "transfer_data"],
-            });
-            if (pi?.application_fee_amount) {
-              applicationFeeCents = pi.application_fee_amount;
-            }
-            if (pi?.transfer_data?.destination) {
-              destinationAccount = pi.transfer_data.destination; // acct_***
-            }
-            const charge = pi?.latest_charge;
-            if (typeof charge === "object") {
-              chargeId = charge.id || null;
-              balanceTxId = charge.balance_transaction || null;
-            }
-          } catch (e) {
-            console.warn("⚠️ No se pudo expandir PaymentIntent:", e?.message || e);
-          }
-        }
-
-        // 4) Crear/actualizar Order
-        const order = await Order.findOneAndUpdate(
-          { stripeSessionId: sessionObj.id },
-          {
-            stripeSessionId: sessionObj.id,
-            paymentIntentId,
-            chargeId,
-            balanceTxId,
-
-            // Comprador
-            userId,
-            phone,
-            email,
-            buyerName: name,
-
-            // Negocio / evento
-            clubId,
-            eventId,
-
-            // Items
-            items: lineItems.data.map((li) => ({
-              ticketTypeId: li.price?.product || null,
-              name:
-                li.description ||
-                li.price?.nickname ||
-                li.price?.product ||
-                "Entrada",
-              unitAmount: li.amount_total
-                ? Math.floor(li.amount_total / (li.quantity || 1))
-                : li.price?.unit_amount || 0,
-              qty: li.quantity || 1,
-              currency: (li.price?.currency || currency || "eur").toLowerCase(),
-            })),
-
-            // Totales / fees
-            currency,
-            subtotalCents,
-            applicationFeeCents,
-            destinationAccount,
-
-            // Metadatos
-            sessionMetadata: sessionObj.metadata || {},
-
-            status: "paid",
-          },
-          { upsert: true, new: true }
-        );
-
-        // (Opcional) título/fecha del evento para el email
-        const eventTitle = `Evento ${eventId}`;
-        const eventDate = "";
-
-        // 5) Emitir tickets: 1 por unidad
-        for (const li of lineItems.data) {
-          const qty = li.quantity || 1;
-          for (let i = 0; i < qty; i++) {
-            // token + firma HMAC
-            const token = crypto.randomBytes(16).toString("base64url"); // 128 bits
-            const hmac = crypto
-              .createHmac("sha256", process.env.QR_HMAC_KEY)
-              .update(`${token}|${eventId}`)
-              .digest("base64url");
-            const payload = `NV1:t=${token}&e=${eventId}&s=${hmac}`;
-
-            // solo guardamos hash del token
-            const tokenHash = await bcrypt.hash(token, 10);
-
-            // serial corto legible (p.ej. NV-AB12-3F)
-            const serial = `NV-${crypto
-              .randomBytes(2)
-              .toString("hex")
-              .toUpperCase()}-${crypto
-              .randomBytes(1)
-              .toString("hex")
-              .toUpperCase()}`;
-
-            // persistir ticket
-            const ticket = await Ticket.create({
-              eventId,
-              orderId: order._id,
-              ownerUserId: userId,
-              email,
-              ticketTypeId: li.price?.product || null,
-              serial,
-              tokenHash,
-              status: "issued",
-            });
-
-            // QR PNG (con el payload firmado)
-            const qrPng = await QRCode.toBuffer(payload, {
-              errorCorrectionLevel: "M",
-              width: 480,
-            });
-
-            // email con la entrada (si hay email)
-            if (email) {
-              await sendTicketEmail({
-                to: email,
-                eventTitle,
-                eventDate,
-                serial: ticket.serial,
-                qrPngBuffer: qrPng,
-              });
-            } else {
-              console.log(
-                "⚠️ Ticket emitido SIN email (no disponible): serial",
-                ticket.serial
-              );
-            }
-          }
-        }
-
-        console.log("🎟️  Tickets emitidos para order", order._id.toString());
-      } catch (err) {
-        console.error("❌ Error procesando checkout.session.completed:", err);
-      }
-    }
-
-    res.json({ received: true });
-  }
-);*/
 
 if (process.env.NODE_ENV !== 'production') {
   // === DEBUG: ver estado de una Checkout Session (y su PI) ===
@@ -1142,7 +938,10 @@ app.post('/api/debug/resend-ticket', express.json(), async (req, res) => {
     if (!process.env.DEBUG_ADMIN_TOKEN || token !== process.env.DEBUG_ADMIN_TOKEN) {
       return res.status(403).json({ error: 'forbidden' });
     }
-    const { orderId, to } = req.body || {};
+    // `to` del body se IGNORA a propósito: las entradas solo se reenvían al
+    // email de la orden (el check-in valida por serial, así que enviarlas a
+    // otra dirección equivale a regalar la entrada).
+    const { orderId } = req.body || {};
     if (!orderId) return res.status(400).json({ error: 'missing_orderId' });
 
     const order = await Order.findById(orderId);
@@ -1151,8 +950,8 @@ app.post('/api/debug/resend-ticket', express.json(), async (req, res) => {
       return res.status(409).json({ error: 'order_not_paid', status: order.status });
     }
 
-    const toEmail = (to && String(to).trim()) || order.email;
-    if (!toEmail) return res.status(400).json({ error: 'no_email' });
+    const toEmail = typeof order.email === 'string' ? order.email.trim() : '';
+    if (!toEmail) return res.status(400).json({ error: 'no_email', message: 'La orden no tiene email' });
 
     const ticketsDocs = await Ticket.find({
       orderId: order._id,
