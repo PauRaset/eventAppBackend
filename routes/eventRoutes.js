@@ -11,6 +11,9 @@ const router = express.Router();
 
 const Event = require("../models/Event");
 const Order = require("../models/Order"); // entradas: compra pagada = Order.status 'paid'
+const Ticket = require("../models/Ticket");
+const Club = require("../models/Club");
+const { makeToken } = require("../utils/ticketToken");
 const User = require("../models/User");
 const Notification = require("../models/Notification");
 const { sendPushNotificationToUser } = require("../utils/sendPushNotification");
@@ -471,6 +474,9 @@ async function anyAuth(req, res, next) {
     req.firebaseUser = {
       uid: decoded.uid,
       phone: decoded.phone_number || decoded.phoneNumber || null,
+      // Email solo fiable si Firebase lo marca como verificado (lo usa /my-tickets/full)
+      email: decoded.email || null,
+      emailVerified: decoded.email_verified === true,
     };
     return next();
   } catch (_) {
@@ -1581,6 +1587,240 @@ router.get("/my-tickets", optionalUserId, async (req, res) => {
   } catch (err) {
     console.error("[GET /events/my-tickets] error:", err);
     return res.status(500).json({ eventIds: [] });
+  }
+});
+
+/* ------------------------------------------------------------------
+   MIS ENTRADAS (detalle completo para la app)
+   GET /api/events/my-tickets/full
+   ANTES de "/:id" para que Express no lo tome como un id.
+
+   Busca por:
+   - ownerUserId = uid de Firebase
+   - ownerUserId = _id de Mongo
+   - email del comprador, SOLO si Firebase lo da como verificado. User.email
+     no sirve: /api/auth/update deja poner cualquiera sin verificar, y como el
+     check-in valida por serial, devolver el serial a quien no es el dueño
+     permitiría entrar con su entrada.
+
+   Nunca devuelve tokenHash, token ni checkedInBy.
+------------------------------------------------------------------- */
+
+// Un evento se considera terminado en endAt; si no lo tiene, 12 h después de
+// empezar (eventos nocturnos que no rellenan la hora de fin).
+const EVENT_DEFAULT_DURATION_MS = 12 * 60 * 60 * 1000;
+
+function eventTimes(ev) {
+  const start = ev?.startAt || ev?.date || null;
+  const startMs = start ? new Date(start).getTime() : null;
+  let endMs = ev?.endAt ? new Date(ev.endAt).getTime() : null;
+  if (endMs === null && startMs !== null) endMs = startMs + EVENT_DEFAULT_DURATION_MS;
+  return {
+    startMs: Number.isFinite(startMs) ? startMs : null,
+    endMs: Number.isFinite(endMs) ? endMs : null,
+  };
+}
+
+function escapeRegExpLiteral(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Identidad del usuario para decidir qué entradas son suyas.
+ * ÚNICO criterio de propiedad de entradas: lo usan /my-tickets/full (consulta)
+ * y /my-tickets/:ticketId/qr (comprobación). No duplicar en otro sitio.
+ * - ownerIds: uid de Firebase y _id de Mongo.
+ * - verifiedEmail: SOLO el email que Firebase marca como verificado
+ *   (User.email se puede cambiar sin verificar en /api/auth/update).
+ */
+function ticketOwnerFromRequest(req) {
+  const ownerIds = [...new Set([req.firebaseUser?.uid, req.user?.id].filter(Boolean).map(String))];
+  const email =
+    req.firebaseUser?.emailVerified === true && typeof req.firebaseUser.email === "string"
+      ? req.firebaseUser.email.trim().toLowerCase()
+      : "";
+  const verifiedEmail = email && !/@firebase\.local$/.test(email) ? email : "";
+  return { ownerIds, verifiedEmail };
+}
+
+/** Filtro de Mongo con las entradas del usuario, o null si no hay identidad. */
+function ticketOwnerFilter(owner) {
+  const or = [];
+  if (owner.ownerIds.length) or.push({ ownerUserId: { $in: owner.ownerIds } });
+  if (owner.verifiedEmail) {
+    or.push({ email: new RegExp(`^${escapeRegExpLiteral(owner.verifiedEmail)}$`, "i") });
+  }
+  return or.length ? { $or: or } : null;
+}
+
+/** Misma regla que ticketOwnerFilter, aplicada a un ticket ya cargado. */
+function isTicketOwner(ticket, owner) {
+  if (!ticket) return false;
+  if (ticket.ownerUserId && owner.ownerIds.includes(String(ticket.ownerUserId))) return true;
+  if (
+    owner.verifiedEmail &&
+    typeof ticket.email === "string" &&
+    ticket.email.toLowerCase() === owner.verifiedEmail // = regex ^email$ con flag i
+  ) {
+    return true;
+  }
+  return false;
+}
+
+router.get("/my-tickets/full", anyAuth, ensureUserId, async (req, res) => {
+  try {
+    const ownerFilter = ticketOwnerFilter(ticketOwnerFromRequest(req));
+    if (!ownerFilter) return res.json([]);
+    const or = ownerFilter.$or;
+
+    const tickets = await Ticket.find({ $or: or })
+      .select("_id eventId orderId serial status issuedAt checkedInAt ticketTypeId")
+      .lean();
+    if (!tickets.length) return res.json([]);
+
+    // --- Carga en bloque: eventos, órdenes y clubs ---
+    const eventIds = [...new Set(tickets.map((t) => String(t.eventId)).filter(mongoose.isValidObjectId))];
+    const orderIds = [...new Set(tickets.map((t) => t.orderId && String(t.orderId)).filter(Boolean))];
+
+    const [events, orders] = await Promise.all([
+      Event.find({ _id: { $in: eventIds } })
+        .select("_id title image startAt endAt date city street ticketTiers.tierId ticketTiers.name club createdBy")
+        .lean(),
+      Order.find({ _id: { $in: orderIds } })
+        .select("_id amountEUR currency qty tierName")
+        .lean(),
+    ]);
+    const eventById = new Map(events.map((e) => [String(e._id), e]));
+    const orderById = new Map(orders.map((o) => [String(o._id), o]));
+
+    // Nombre del club: Club por event.club; si no, el User propietario (entityName...)
+    const clubRefIds = [...new Set(events.map((e) => e.club && String(e.club)).filter(Boolean))];
+    const ownerRefIds = [...new Set(events.map((e) => e.createdBy && String(e.createdBy)).filter(Boolean))];
+    const [clubs, owners] = await Promise.all([
+      clubRefIds.length ? Club.find({ _id: { $in: clubRefIds } }).select("_id name").lean() : [],
+      ownerRefIds.length
+        ? User.find({ _id: { $in: ownerRefIds } }).select("_id entityName entName displayName username").lean()
+        : [],
+    ]);
+    const clubNameById = new Map(clubs.map((c) => [String(c._id), c.name]));
+    const ownerNameById = new Map(
+      owners.map((u) => [String(u._id), u.entityName || u.entName || u.displayName || u.username || ""])
+    );
+
+    const now = Date.now();
+
+    const rows = tickets.map((t) => {
+      const ev = eventById.get(String(t.eventId)) || null;
+      const ord = t.orderId ? orderById.get(String(t.orderId)) : null;
+      const { startMs, endMs } = eventTimes(ev);
+      const ended = endMs !== null && endMs < now;
+
+      const tier = t.ticketTypeId
+        ? (ev?.ticketTiers || []).find((x) => x.tierId === t.ticketTypeId)
+        : null;
+
+      let state;
+      if (t.status === "refunded") state = "reembolsada";
+      else if (t.status === "checked_in") state = "usada";
+      else if (ended) state = "pasada";
+      else state = "activa";
+
+      const clubName =
+        (ev?.club && clubNameById.get(String(ev.club))) ||
+        (ev?.createdBy && ownerNameById.get(String(ev.createdBy))) ||
+        "";
+
+      return {
+        _sortStart: startMs,
+        _upcoming: !ended,
+        ticketId: String(t._id),
+        serial: t.serial,
+        status: t.status,
+        state,
+        issuedAt: t.issuedAt || null,
+        checkedInAt: t.checkedInAt || null,
+        ticketTypeId: t.ticketTypeId || null,
+        tierName: tier?.name || ord?.tierName || null,
+        event: ev
+          ? {
+              _id: String(ev._id),
+              title: ev.title || "",
+              imageUrl: absUrlFromUpload(req, ev.image),
+              startAt: ev.startAt || ev.date || null,
+              city: ev.city || "",
+              street: ev.street || "",
+            }
+          : null,
+        club: clubName ? { name: clubName } : null,
+        // amountEUR es el total de la orden (qty entradas), sin la comisión.
+        order: ord
+          ? { amountEUR: ord.amountEUR ?? null, currency: ord.currency || "eur", qty: ord.qty || 1 }
+          : null,
+      };
+    });
+
+    // Futuras primero (la más próxima arriba); luego pasadas (la más reciente arriba).
+    // Sin fecha: al final de su grupo.
+    rows.sort((a, b) => {
+      if (a._upcoming !== b._upcoming) return a._upcoming ? -1 : 1;
+      const as = a._sortStart, bs = b._sortStart;
+      if (as === null && bs === null) return 0;
+      if (as === null) return 1;
+      if (bs === null) return -1;
+      return a._upcoming ? as - bs : bs - as;
+    });
+
+    return res.json(rows.map(({ _sortStart, _upcoming, ...rest }) => rest));
+  } catch (err) {
+    console.error("[GET /events/my-tickets/full] error:", err);
+    return res.status(500).json({ message: "Error obteniendo tus entradas" });
+  }
+});
+
+/* ------------------------------------------------------------------
+   QR DE UNA ENTRADA (solo su dueño)
+   GET /api/events/my-tickets/:ticketId/qr -> { serial, qrPayload }
+   ANTES de "/:id". qrPayload = JSON.stringify({ serial, token: makeToken(serial) }),
+   el mismo formato que el QR del email; la app pinta la imagen en el cliente.
+------------------------------------------------------------------- */
+router.get("/my-tickets/:ticketId/qr", anyAuth, ensureUserId, async (req, res) => {
+  try {
+    // El QR da acceso al evento: que nadie lo guarde en caché.
+    res.set("Cache-Control", "no-store");
+
+    const { ticketId } = req.params;
+    if (!mongoose.isValidObjectId(ticketId)) {
+      return res.status(400).json({ message: "ID de entrada inválido" });
+    }
+
+    const ticket = await Ticket.findById(ticketId)
+      .select("_id serial status ownerUserId email")
+      .lean();
+    if (!ticket) return res.status(404).json({ message: "Entrada no encontrada" });
+
+    // ⚠️ Propiedad: mismo criterio que /my-tickets/full (ticketOwnerFromRequest).
+    if (!isTicketOwner(ticket, ticketOwnerFromRequest(req))) {
+      console.warn("[GET /events/my-tickets/:ticketId/qr] acceso denegado", {
+        ticketId: String(ticket._id),
+        userId: req.user?.id || null,
+      });
+      return res.status(403).json({ message: "Esta entrada no es tuya" });
+    }
+
+    if (ticket.status === "refunded") {
+      return res.status(403).json({ reason: "refunded", message: "Esta entrada está reembolsada" });
+    }
+
+    if (!ticket.serial) {
+      return res.status(409).json({ message: "La entrada no tiene serial" });
+    }
+
+    const serial = ticket.serial;
+    const qrPayload = JSON.stringify({ serial, token: makeToken(serial) });
+    return res.json({ serial, qrPayload });
+  } catch (err) {
+    console.error("[GET /events/my-tickets/:ticketId/qr] error:", err);
+    return res.status(500).json({ message: "Error generando el QR" });
   }
 });
 
