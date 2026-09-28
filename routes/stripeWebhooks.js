@@ -19,23 +19,8 @@ const stripe2 = new Stripe2(process.env.STRIPE_SECRET_KEY, {
   apiVersion: '2024-06-20',
 });
 
-function genSerial() {
-  const a = crypto.randomBytes(2).toString('hex').toUpperCase();
-  const b = crypto.randomBytes(2).toString('hex').toUpperCase();
-  return `NV-${a}-${b}`;
-}
-
-function makeToken(serial) {
-  const raw = `${serial}.${Date.now()}.${Math.random()
-    .toString(36)
-    .slice(2, 8)}`;
-  const sig = crypto
-    .createHmac('sha256', process.env.QR_HMAC_KEY || 'nv_dev')
-    .update(raw)
-    .digest('hex')
-    .slice(0, 16);
-  return `${raw}.${sig}`;
-}
+// Serial y token del QR: compartidos con /api/events/my-tickets/:ticketId/qr
+const { genSerial, makeToken } = require('../utils/ticketToken');
 
 async function sendTicketEmailWithRetry(payload, { attempts = 3, baseDelayMs = 800 } = {}) {
   let lastErr;
