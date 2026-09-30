@@ -44,7 +44,7 @@ try {
 } catch (e) {
   console.error('❌ No se pudo cargar ./routes/referralAnalytics (analytics deshabilitado):', e);
 }
-const { anyAuthWithId } = require("./middlewares/authMiddleware");
+const { anyAuthWithId, anyAuth, ensureUserId } = require("./middlewares/authMiddleware");
 
 // ✅ Inicializa firebase-admin y loguea el project_id para depurar 403
 const admin = require("./middlewares/firebaseAdmin");
@@ -640,31 +640,113 @@ app.post("/api/orders", async (req, res) => {
   }
 });
 
-/* ========= NUEVO: endpoints de lectura de órdenes para el front ========= */
-// GET /api/orders/by-session/:sid  -> usado por /purchase/success
-app.get("/api/orders/by-session/:sid", async (req, res) => {
+/* ========= Endpoints de lectura de órdenes para el front ========= */
+// Rutas públicas (sin auth): límite estricto para que no se puedan enumerar ids.
+const publicOrderLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minuto
+  max: 30,             // 30 peticiones por IP/min
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// "ra***@gmail.com" -> suficiente para "te lo hemos enviado a ..." sin exponer la dirección
+function _maskEmail(e) {
+  const email = _cleanEmail(e);
+  const at = email.lastIndexOf("@");
+  if (at <= 0) return null;
+  const local = email.slice(0, at);
+  const domain = email.slice(at + 1);
+  return `${local.slice(0, Math.min(2, local.length))}***@${domain}`;
+}
+
+// ⚠️ Solo campos no sensibles: nada de email completo, phone, buyerName, ids de Stripe, etc.
+const PUBLIC_ORDER_FIELDS = "status ticketsIssuedAt eventId qty amountEUR currency tierName email";
+function _publicOrderView(order) {
+  return {
+    status: order.status,
+    ticketsIssuedAt: order.ticketsIssuedAt || null,
+    eventId: order.eventId,
+    qty: order.qty,
+    amountEUR: order.amountEUR,
+    currency: order.currency,
+    tierName: order.tierName || "",
+    emailMasked: _maskEmail(order.email),
+  };
+}
+
+// GET /api/orders/by-session/:sid  -> usado por /purchase/success (usuario no autenticado)
+app.get("/api/orders/by-session/:sid", publicOrderLimiter, async (req, res) => {
   try {
-    const sid = decodeURIComponent(req.params.sid || "");
+    const sid = String(req.params.sid || "").trim();
     if (!sid) return res.status(400).json({ error: "missing_sid" });
 
-    const order = await Order.findOne({ stripeSessionId: sid }).lean();
+    const order = await Order.findOne({ stripeSessionId: sid }).select(PUBLIC_ORDER_FIELDS).lean();
     if (!order) return res.status(404).json({ error: "order_not_found" });
 
-    return res.json({ order });
+    return res.json({ order: _publicOrderView(order) });
   } catch (e) {
     console.error("GET /api/orders/by-session error:", e);
     return res.status(500).json({ error: "server_error" });
   }
 });
 
-// (Opcional) GET /api/orders/:id  -> por si alguna vez lo necesitas
-app.get("/api/orders/:id", async (req, res) => {
+// (Opcional) GET /api/orders/:id  -> misma vista reducida
+app.get("/api/orders/:id", publicOrderLimiter, async (req, res) => {
   try {
-    const order = await Order.findById(req.params.id).lean();
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(404).json({ error: "order_not_found" });
+    }
+    const order = await Order.findById(req.params.id).select(PUBLIC_ORDER_FIELDS).lean();
     if (!order) return res.status(404).json({ error: "order_not_found" });
-    return res.json({ order });
+    return res.json({ order: _publicOrderView(order) });
   } catch (e) {
     console.error("GET /api/orders/:id error:", e);
+    return res.status(500).json({ error: "server_error" });
+  }
+});
+
+// GET /api/orders/:id/status  -> app (autenticado, solo el dueño de la orden)
+// Devuelve los ticketIds para pedir el QR con GET /api/events/my-tickets/:ticketId/qr
+app.get("/api/orders/:id/status", anyAuth, ensureUserId, async (req, res) => {
+  try {
+    res.set("Cache-Control", "no-store");
+
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(404).json({ error: "order_not_found" });
+    }
+
+    const order = await Order.findById(req.params.id)
+      .select("_id userId status ticketsIssuedAt tierName qty")
+      .lean();
+    if (!order) return res.status(404).json({ error: "order_not_found" });
+
+    // Identidades del usuario: uid de Firebase + _id de Mongo (anyAuth deja el uid en req.user.id
+    // cuando es Firebase, así que resolvemos el _id buscando por firebaseUid, sin crear nada).
+    const ownerIds = new Set([req.firebaseUser?.uid, req.user?.id].filter(Boolean).map(String));
+    if (req.firebaseUser?.uid && UserModel) {
+      const u = await UserModel.findOne({ firebaseUid: req.firebaseUser.uid }).select("_id").lean();
+      if (u) ownerIds.add(String(u._id));
+    }
+
+    if (!order.userId || !ownerIds.has(String(order.userId))) {
+      console.warn("[GET /api/orders/:id/status] acceso denegado", {
+        orderId: String(order._id),
+        userId: req.user?.id || null,
+      });
+      return res.status(403).json({ error: "forbidden" });
+    }
+
+    const tickets = await Ticket.find({ orderId: order._id }).select("_id").lean();
+
+    return res.json({
+      status: order.status,
+      ticketsIssuedAt: order.ticketsIssuedAt || null,
+      ticketIds: tickets.map((t) => String(t._id)),
+      tierName: order.tierName || "",
+      qty: order.qty,
+    });
+  } catch (e) {
+    console.error("GET /api/orders/:id/status error:", e);
     return res.status(500).json({ error: "server_error" });
   }
 });
