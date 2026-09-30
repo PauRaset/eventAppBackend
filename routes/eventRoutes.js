@@ -1667,6 +1667,30 @@ function isTicketOwner(ticket, owner) {
   return false;
 }
 
+/**
+ * Precio unitario (EUR) de una entrada, por orden de preferencia:
+ * 1) priceEUR del tier del evento, 2) unitAmount (céntimos) del item de la orden
+ * con ese ticketTypeId, 3) amountEUR / qty de la orden. Si nada aplica, null.
+ */
+function ticketUnitPriceEUR(ticket, tier, order) {
+  const tierPrice = Number(tier?.priceEUR);
+  if (tier && tier.priceEUR != null && Number.isFinite(tierPrice)) return tierPrice;
+
+  if (ticket.ticketTypeId && Array.isArray(order?.items)) {
+    const item = order.items.find((it) => it?.ticketTypeId === ticket.ticketTypeId);
+    const cents = Number(item?.unitAmount);
+    if (item && item.unitAmount != null && Number.isFinite(cents)) return cents / 100;
+  }
+
+  const total = Number(order?.amountEUR);
+  const qty = Number(order?.qty);
+  if (order?.amountEUR != null && Number.isFinite(total) && Number.isFinite(qty) && qty > 0) {
+    return Math.round((total / qty) * 100) / 100;
+  }
+
+  return null;
+}
+
 router.get("/my-tickets/full", anyAuth, ensureUserId, async (req, res) => {
   try {
     const ownerFilter = ticketOwnerFilter(ticketOwnerFromRequest(req));
@@ -1684,10 +1708,10 @@ router.get("/my-tickets/full", anyAuth, ensureUserId, async (req, res) => {
 
     const [events, orders] = await Promise.all([
       Event.find({ _id: { $in: eventIds } })
-        .select("_id title image startAt endAt date city street ticketTiers.tierId ticketTiers.name club createdBy")
+        .select("_id title image startAt endAt date city street ticketTiers.tierId ticketTiers.name ticketTiers.priceEUR club createdBy")
         .lean(),
       Order.find({ _id: { $in: orderIds } })
-        .select("_id amountEUR currency qty tierName")
+        .select("_id amountEUR currency qty tierName items.ticketTypeId items.unitAmount")
         .lean(),
     ]);
     const eventById = new Map(events.map((e) => [String(e._id), e]));
@@ -1753,8 +1777,14 @@ router.get("/my-tickets/full", anyAuth, ensureUserId, async (req, res) => {
           : null,
         club: clubName ? { name: clubName } : null,
         // amountEUR es el total de la orden (qty entradas), sin la comisión.
+        // unitAmountEUR es el precio de ESTA entrada.
         order: ord
-          ? { amountEUR: ord.amountEUR ?? null, currency: ord.currency || "eur", qty: ord.qty || 1 }
+          ? {
+              amountEUR: ord.amountEUR ?? null,
+              unitAmountEUR: ticketUnitPriceEUR(t, tier, ord),
+              currency: ord.currency || "eur",
+              qty: ord.qty || 1,
+            }
           : null,
       };
     });
