@@ -91,6 +91,7 @@ const Ticket = require("./models/Ticket");
 const CheckInLog = require("./models/CheckInLog");
 const sendTicketEmail = require("./utils/sendTicketEmail");
 const sendSimpleEmail = require("./utils/sendSimpleEmail");
+const { verifyToken } = require("./utils/ticketToken");
 const ClubApplication = require("./models/ClubApplication");
 const jwt = require("jsonwebtoken");
 
@@ -752,158 +753,284 @@ app.get("/api/orders/:id/status", anyAuth, ensureUserId, async (req, res) => {
 });
 
 // ===== Check-in de tickets (escáner) =====
-app.post("/api/checkin", async (req, res) => {
+// Autenticación por club: x-scanner-key se busca en Club.scannerApiKey.
+// ⚠️ COMPATIBILIDAD TEMPORAL: la clave global SCANNER_API_KEY se sigue aceptando en
+// "modo legacy" (sin club identificado) mientras se migra el scanner del portal.
+// En modo legacy se omiten las validaciones de club y evento, pero NO la de firma.
+
+// Igual que eventTimes() en routes/eventRoutes.js: sin endAt, el evento dura 12 h.
+const CHECKIN_EVENT_DEFAULT_DURATION_MS = 12 * 60 * 60 * 1000;
+// Tras el fin del evento, aún se aceptan entradas durante este margen.
+const CHECKIN_GRACE_AFTER_END_MS = 12 * 60 * 60 * 1000;
+
+function _scannerKeyFromReq(req) {
+  const k = req.headers["x-scanner-key"];
+  return typeof k === "string" ? k.trim() : "";
+}
+
+// 120 peticiones/min por clave de scanner (sin clave -> por IP).
+// La clave se hashea para no guardarla en claro en el store del limiter.
+const checkinLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => {
+    const key = _scannerKeyFromReq(req);
+    if (key) return "sk:" + crypto.createHash("sha256").update(key).digest("hex");
+    return "ip:" + (rateLimit.ipKeyGenerator ? rateLimit.ipKeyGenerator(req.ip) : req.ip);
+  },
+  handler: (_req, res) => res.status(429).json({ ok: false, reason: "rate_limited" }),
+});
+
+/** { club, legacy:false } si la clave es de un club; { club:null, legacy:true } si es la global; si no, null. */
+async function _resolveScanner(key) {
+  if (!key) return null;
+
+  if (Club) {
+    const club = await Club.findOne({ scannerApiKey: key })
+      .select("_id name ownerUserId managers")
+      .lean();
+    if (club) return { club, legacy: false };
+  }
+
+  const globalKey = process.env.SCANNER_API_KEY || "";
+  if (globalKey) {
+    const a = Buffer.from(key, "utf8");
+    const b = Buffer.from(globalKey, "utf8");
+    if (a.length === b.length && crypto.timingSafeEqual(a, b)) {
+      return { club: null, legacy: true };
+    }
+  }
+  return null;
+}
+
+/**
+ * ¿El evento es del club que escanea?
+ * - Si el evento tiene vínculo explícito (club / clubId), manda ese vínculo.
+ * - Eventos antiguos sin club: createdBy (User) debe ser owner o manager del club,
+ *   comparando por _id, firebaseUid o email (como resolveConnectedAccount).
+ */
+async function _eventBelongsToClub(ev, club) {
+  const clubId = String(club._id);
+  const evClub = ev.club ? String(ev.club) : "";
+  const evClubId = String(ev.clubId || "").trim();
+  if (evClub || evClubId) return evClub === clubId || evClubId === clubId;
+
+  if (!ev.createdBy) return false;
+  const creatorIds = new Set([String(ev.createdBy)]);
+  if (UserModel && mongoose.isValidObjectId(String(ev.createdBy))) {
+    try {
+      const u = await UserModel.findById(ev.createdBy).select("email firebaseUid").lean();
+      if (u?.email) creatorIds.add(_cleanEmail(u.email));
+      if (u?.firebaseUid) creatorIds.add(String(u.firebaseUid));
+    } catch {}
+  }
+
+  const clubPeople = [club.ownerUserId, ...(club.managers || [])].filter(Boolean).map(String);
+  return clubPeople.some((x) => creatorIds.has(x) || creatorIds.has(_cleanEmail(x)));
+}
+
+/** true si el evento terminó hace más de CHECKIN_GRACE_AFTER_END_MS. Antes de empezar: false. */
+function _eventEndedTooLongAgo(ev, now = Date.now()) {
+  const start = ev?.startAt || ev?.date || null;
+  const startMs = start ? new Date(start).getTime() : NaN;
+  let endMs = ev?.endAt ? new Date(ev.endAt).getTime() : NaN;
+  if (!Number.isFinite(endMs) && Number.isFinite(startMs)) {
+    endMs = startMs + CHECKIN_EVENT_DEFAULT_DURATION_MS;
+  }
+  // Sin fechas no podemos saberlo: no bloqueamos la entrada.
+  if (!Number.isFinite(endMs)) return false;
+  return now > endMs + CHECKIN_GRACE_AFTER_END_MS;
+}
+
+// El log de auditoría nunca debe tumbar un check-in (p.ej. tras marcar la entrada como usada).
+async function _logCheckin(entry) {
   try {
-    // Seguridad básica por API key (MVP) + rate limiting aplicado arriba
-    const key = req.headers["x-scanner-key"];
-    if (!key || key !== process.env.SCANNER_API_KEY) {
+    await CheckInLog.create(entry);
+  } catch (e) {
+    console.error("[checkin] no se pudo guardar CheckInLog:", e?.message || e);
+  }
+}
+
+/*
+ * ⚠️ CÓDIGO MUERTO (comentado, no borrado): modo "NV1" (token + eventId + hmac).
+ * Nunca encontraba nada: el webhook guarda tokenHash como SHA-256 hex y aquí se
+ * comparaba con bcrypt. Además ningún QR actual usa este formato (todos son
+ * JSON.stringify({ serial, token })). Sustituido por verifyToken(token, serial).
+ *
+ *   const expected = crypto
+ *     .createHmac("sha256", process.env.QR_HMAC_KEY || "")
+ *     .update(`${token}|${eventId}`)
+ *     .digest("base64url");
+ *
+ *   if (expected !== hmac) {
+ *     await CheckInLog.create({ ticketId: null, eventId, result: "bad_signature" });
+ *     return res.status(400).json({ ok: false, reason: "bad_signature" });
+ *   }
+ *
+ *   const candidates = await Ticket.find({
+ *     eventId,
+ *     status: { $in: ["issued", "checked_in"] },
+ *   }).limit(10000);
+ *
+ *   for (const t of candidates) {
+ *     const ok = await bcrypt.compare(token, t.tokenHash);
+ *     if (ok) { found = t; break; }
+ *   }
+ */
+
+app.post("/api/checkin", checkinLimiter, async (req, res) => {
+  try {
+    // ---------- Autenticación: ¿qué club escanea? ----------
+    const scanner = await _resolveScanner(_scannerKeyFromReq(req));
+    if (!scanner) {
       return res.status(401).json({ ok: false, reason: "unauthorized" });
     }
+    const scanClubId = scanner.club ? String(scanner.club._id) : null;
+    if (scanner.legacy) {
+      console.warn(
+        "⚠️ [checkin] Clave GLOBAL SCANNER_API_KEY usada (modo legacy, sin club): " +
+          "se omiten las validaciones de club y evento. Migra el scanner a la clave del club."
+      );
+    }
 
-    const { token, eventId, hmac, serial } = req.body || {};
-    console.log("[checkin] body:", req.body);
+    // ---------- Entrada: { serial, token, eventId } ----------
+    // Solo strings: evita que un objeto ({ $ne: null }) llegue a las consultas.
+    // ⚠️ No loguear el body: contiene el token de la entrada.
+    const body = req.body || {};
+    const serial = typeof body.serial === "string" ? body.serial.trim() : "";
+    const token = typeof body.token === "string" ? body.token.trim() : "";
+    const scanEventId =
+      typeof body.eventId === "string" && body.eventId.trim() ? body.eventId.trim() : null;
 
-    // Soportamos dos modos:
-    //  1) Formato nuevo  -> token + eventId + hmac  (NV1)
-    //  2) Formato legacy -> serial + token         (JSON antiguo)
-    const isNewFormat = !!(token && eventId && hmac);
-    const isLegacyFormat = !!(serial && token);
-
-    if (!isNewFormat && !isLegacyFormat) {
+    if (!serial || !token) {
       return res.status(400).json({ ok: false, reason: "bad_request" });
     }
 
-    let found = null;
-    let effectiveEventId = eventId || null;
-
-    if (isNewFormat) {
-      // ---------- Modo nuevo: token + eventId + hmac ----------
-      // Verificar firma HMAC
-      const expected = crypto
-        .createHmac("sha256", process.env.QR_HMAC_KEY || "")
-        .update(`${token}|${eventId}`)
-        .digest("base64url");
-
-      if (expected !== hmac) {
-        await CheckInLog.create({
-          ticketId: null,
-          eventId,
-          result: "bad_signature",
-        });
-        return res.status(400).json({ ok: false, reason: "bad_signature" });
-      }
-
-      // Buscar ticket por comparación de hash dentro del evento
-      const candidates = await Ticket.find({
-        eventId,
-        status: { $in: ["issued", "checked_in"] },
-      }).limit(10000);
-
-      for (const t of candidates) {
-        const ok = await bcrypt.compare(token, t.tokenHash);
-        if (ok) {
-          found = t;
-          break;
-        }
-      }
-
-      effectiveEventId = eventId;
-    } else if (isLegacyFormat) {
-      // ---------- Modo legacy: serial + token ----------
-      // Compatibilidad hacia atrás: algunas entradas antiguas codifican solo
-      // { serial, token } en el QR y no tienen un tokenHash verificable.
-      // Para estas, validamos únicamente por serial.
-      const cand = await Ticket.findOne({
-        serial,
-        status: { $in: ["issued", "checked_in"] },
-      });
-
-      if (!cand) {
-        await CheckInLog.create({
-          ticketId: null,
-          eventId: null,
-          result: "invalid",
-        });
-        return res.status(404).json({ ok: false, reason: "invalid" });
-      }
-
-      // A partir de aquí tratamos igual que en el formato nuevo
-      found = cand;
-      effectiveEventId = cand.eventId || null;
+    // a) Firma del token (sin BD)
+    if (!verifyToken(token, serial)) {
+      await _logCheckin({ ticketId: null, eventId: scanEventId, clubId: scanClubId, result: "bad_signature" });
+      return res.status(400).json({ ok: false, reason: "bad_signature" });
     }
 
-    if (!found) {
-      await CheckInLog.create({
-        ticketId: null,
-        eventId: effectiveEventId,
-        result: "invalid",
-      });
+    // b) Existe la entrada
+    const ticket = await Ticket.findOne({ serial })
+      .select("_id eventId orderId ticketTypeId serial status checkedInAt")
+      .lean();
+    if (!ticket) {
+      await _logCheckin({ ticketId: null, eventId: scanEventId, clubId: scanClubId, result: "invalid" });
       return res.status(404).json({ ok: false, reason: "invalid" });
     }
 
-    // Cargar orden para devolver buyerName/email
-    let buyerName = "";
-    let buyerEmail = "";
-    try {
-      if (found.orderId) {
-        const ord = await Order.findById(found.orderId)
-          .select("buyerName email")
-          .lean();
-        if (ord) {
-          buyerName = ord.buyerName || "";
-          buyerEmail = ord.email || "";
-        }
+    const ticketEventId = String(ticket.eventId || "");
+    const logTicket = (result) =>
+      _logCheckin({ ticketId: ticket._id, eventId: ticketEventId, clubId: scanClubId, result });
+
+    // c) Estado: reembolsada
+    if (ticket.status === "refunded") {
+      await logTicket("refunded");
+      return res.json({ ok: false, reason: "refunded" });
+    }
+
+    // Evento de la entrada (título, tiers, club y fechas)
+    let ev = null;
+    if (EventModel && mongoose.isValidObjectId(ticketEventId)) {
+      ev = await EventModel.findById(ticketEventId)
+        .select("title club clubId createdBy startAt endAt date ticketTiers.tierId ticketTiers.name")
+        .lean();
+    }
+    const eventTitle = ev?.title || "";
+
+    if (!scanner.legacy) {
+      // d) El evento es de este club. Sin evento no se puede demostrar -> wrong_club.
+      if (!ev || !(await _eventBelongsToClub(ev, scanner.club))) {
+        await logTicket("wrong_club");
+        return res.json({ ok: false, reason: "wrong_club", eventTitle });
       }
-    } catch {
-      // noop
+
+      // e) Es el evento que se está escaneando (si el portero lo ha fijado)
+      if (scanEventId && scanEventId !== ticketEventId) {
+        await logTicket("wrong_event");
+        return res.json({ ok: false, reason: "wrong_event", eventTitle });
+      }
+
+      // f) Vigente: no terminó hace más de 12 h (si aún no empezó, se acepta)
+      if (_eventEndedTooLongAgo(ev)) {
+        await logTicket("event_ended");
+        return res.json({ ok: false, reason: "event_ended", eventTitle });
+      }
     }
 
-    if (found.status === "checked_in") {
-      await CheckInLog.create({
-        ticketId: found._id,
-        eventId: effectiveEventId,
-        result: "duplicate",
-      });
-      return res.json({
-        ok: false,
-        reason: "duplicate",
-        serial: found.serial,
-        checkedInAt: found.checkedInAt,
-        buyerName,
-        buyerEmail,
-      });
+    // Nombre del comprador (NO el email: el portero no lo necesita)
+    let buyerName = "";
+    let orderTierName = "";
+    if (ticket.orderId) {
+      try {
+        const ord = await Order.findById(ticket.orderId).select("buyerName tierName").lean();
+        buyerName = ord?.buyerName || "";
+        orderTierName = ord?.tierName || "";
+      } catch {
+        // noop
+      }
     }
 
-    // Update atómico
+    const duplicateBody = (t) => ({
+      ok: false,
+      reason: "duplicate",
+      serial: ticket.serial,
+      checkedInAt: t?.checkedInAt || null,
+      buyerName,
+    });
+
+    // g) Ya usada
+    if (ticket.status === "checked_in") {
+      await logTicket("duplicate");
+      return res.json(duplicateBody(ticket));
+    }
+
+    // h) Update atómico issued -> checked_in
     const updated = await Ticket.findOneAndUpdate(
-      { _id: found._id, status: "issued" },
+      { _id: ticket._id, status: "issued" },
       {
         $set: {
           status: "checked_in",
           checkedInAt: new Date(),
-          checkedInBy: "scanner",
+          checkedInBy: scanClubId || "legacy_scanner",
         },
       },
       { new: true }
-    );
+    ).lean();
 
-    const result = updated ? "ok" : "duplicate";
-    await CheckInLog.create({
-      ticketId: found._id,
-      eventId: effectiveEventId,
-      result,
-    });
+    // i) Carrera: otro escaneo (o un reembolso) se adelantó
+    if (!updated) {
+      const fresh = await Ticket.findById(ticket._id).select("status checkedInAt").lean();
+      if (fresh?.status === "refunded") {
+        await logTicket("refunded");
+        return res.json({ ok: false, reason: "refunded" });
+      }
+      await logTicket("duplicate");
+      return res.json(duplicateBody(fresh));
+    }
+
+    await logTicket("ok");
+
+    // tierName: el portero necesita saber si la entrada lleva consumición
+    const tier = ticket.ticketTypeId
+      ? (ev?.ticketTiers || []).find((t) => t.tierId === ticket.ticketTypeId)
+      : null;
 
     return res.json({
-      ok: result === "ok",
-      serial: found.serial,
-      status: updated?.status || found.status,
-      checkedInAt: updated?.checkedInAt || found.checkedInAt,
+      ok: true,
+      serial: ticket.serial,
+      status: "checked_in",
+      checkedInAt: updated.checkedInAt,
       buyerName,
-      buyerEmail,
+      tierName: tier?.name || orderTierName || "",
+      eventTitle,
     });
   } catch (e) {
-    console.error("❌ Error en /api/checkin:", e);
+    console.error("❌ Error en /api/checkin:", e?.message || e);
     return res.status(500).json({ ok: false, reason: "server_error" });
   }
 });
