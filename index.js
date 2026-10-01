@@ -1035,6 +1035,107 @@ app.post("/api/checkin", checkinLimiter, async (req, res) => {
   }
 });
 
+/**
+ * Filtro de Mongo con los eventos del club. Mismo criterio que _eventBelongsToClub:
+ * - vínculo explícito: club / clubId = este club;
+ * - eventos antiguos SIN club ni clubId: createdBy es un User que es owner o manager
+ *   del club (por _id, firebaseUid o email, este último sin distinguir mayúsculas).
+ */
+async function _clubEventsFilter(club) {
+  const clubId = String(club._id);
+  const or = [{ club: club._id }, { clubId }];
+
+  const people = [club.ownerUserId, ...(club.managers || [])].filter(Boolean).map(String);
+  // owner/manager guardado directamente como _id de User
+  const creatorIds = new Set(people.filter((p) => /^[0-9a-f]{24}$/i.test(p)));
+  if (UserModel && people.length) {
+    const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const emails = people.filter((p) => p.includes("@")).map(_cleanEmail);
+    const users = await UserModel.find({
+      $or: [
+        { firebaseUid: { $in: people } },
+        ...(emails.length ? [{ email: { $in: emails.map((e) => new RegExp(`^${escapeRe(e)}$`, "i")) } }] : []),
+      ],
+    })
+      .select("_id")
+      .lean();
+    for (const u of users) creatorIds.add(String(u._id));
+  }
+
+  if (creatorIds.size) {
+    or.push({
+      club: null,
+      clubId: { $in: ["", null] },
+      createdBy: { $in: [...creatorIds] },
+    });
+  }
+  return { $or: or };
+}
+
+// GET /api/checkin/events -> eventos del club para que el portero elija cuál escanea.
+// Misma autenticación y rate limit que POST /api/checkin; la clave global legacy no vale
+// (para listar eventos hace falta saber qué club es).
+app.get("/api/checkin/events", checkinLimiter, async (req, res) => {
+  try {
+    const scanner = await _resolveScanner(_scannerKeyFromReq(req));
+    if (!scanner) {
+      return res.status(401).json({ ok: false, reason: "unauthorized" });
+    }
+    if (scanner.legacy) {
+      return res.status(400).json({ ok: false, reason: "legacy_key_not_supported" });
+    }
+    if (!EventModel) {
+      return res.status(500).json({ ok: false, reason: "server_error" });
+    }
+
+    // Prefiltro aproximado en Mongo; la decisión final la toma _eventEndedTooLongAgo,
+    // el MISMO criterio que el check-in (incluye los que aún no han empezado y los sin fecha).
+    const now = Date.now();
+    const endCutoff = new Date(now - CHECKIN_GRACE_AFTER_END_MS);
+    const startCutoff = new Date(now - CHECKIN_GRACE_AFTER_END_MS - CHECKIN_EVENT_DEFAULT_DURATION_MS);
+
+    const clubFilter = await _clubEventsFilter(scanner.club);
+    const events = await EventModel.find({
+      $and: [
+        clubFilter,
+        // Sin borradores. $ne:false también incluye los eventos antiguos sin el campo (default true).
+        { isPublished: { $ne: false } },
+        {
+          $or: [
+            { endAt: { $gte: endCutoff } },
+            { startAt: { $gte: startCutoff } },
+            { date: { $gte: startCutoff } },
+            { endAt: null, startAt: null, date: null },
+          ],
+        },
+      ],
+    })
+      .select("_id title startAt endAt date")
+      .lean();
+
+    const startMs = (ev) => {
+      const s = ev.startAt || ev.date;
+      const ms = s ? new Date(s).getTime() : NaN;
+      return Number.isFinite(ms) ? ms : Infinity; // sin fecha: al final
+    };
+
+    const list = events
+      .filter((ev) => !_eventEndedTooLongAgo(ev, now))
+      .sort((a, b) => startMs(a) - startMs(b))
+      .map((ev) => ({
+        _id: String(ev._id),
+        title: ev.title || "",
+        startAt: ev.startAt || ev.date || null,
+        endAt: ev.endAt || null,
+      }));
+
+    return res.json({ ok: true, events: list });
+  } catch (e) {
+    console.error("❌ Error en GET /api/checkin/events:", e?.message || e);
+    return res.status(500).json({ ok: false, reason: "server_error" });
+  }
+});
+
 // ===== Rutas de tu app =====
 
 const authRoutes = require("./routes/authRoutes");
