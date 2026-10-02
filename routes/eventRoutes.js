@@ -6,6 +6,7 @@ const sharp = require("sharp");
 const fs = require("fs");
 const mongoose = require("mongoose");
 const crypto = require("crypto");
+const rateLimit = require("express-rate-limit");
 
 const router = express.Router();
 
@@ -1667,6 +1668,82 @@ function isTicketOwner(ticket, owner) {
   return false;
 }
 
+/* ------------------------------------------------------------------
+   ENTRADAS CON NOMBRE (asignación a un acompañante)
+   El comprador NUNCA pierde la custodia: la asignación es una invitación
+   (enlace con claimToken), no una cesión. La propiedad sigue siendo
+   ticketOwnerFromRequest / isTicketOwner.
+------------------------------------------------------------------- */
+function newClaimToken() {
+  return crypto.randomBytes(16).toString("base64url"); // 128 bits, corto para URL
+}
+
+function claimUrlFor(claimToken) {
+  const base = (process.env.PUBLIC_WEB_URL || "https://nightvibe.life").replace(/\/+$/, "");
+  return `${base}/t/${claimToken}`;
+}
+
+/**
+ * Teléfono a formato internacional (+34...) si se puede; si no, lo que llegó.
+ * Solo informativo: NO se usa para autenticar.
+ */
+function normalizePhoneLoose(raw) {
+  const input = String(raw || "").trim().slice(0, 40);
+  if (!input) return "";
+  let s = input.replace(/[\s\-().]/g, "");
+  if (s.startsWith("00")) s = `+${s.slice(2)}`;
+  if (/^\+\d{8,15}$/.test(s)) return s;
+  if (/^[6789]\d{8}$/.test(s)) return `+34${s}`;   // número español sin prefijo
+  if (/^34[6789]\d{8}$/.test(s)) return `+${s}`;   // español con 34 pero sin "+"
+  return input;
+}
+
+/** Asignación para /my-tickets/full (ruta del propietario), o null si no está asignada. */
+function assignmentView(t) {
+  if (!t.claimToken && !t.assignedAt) return null;
+  return {
+    name: t.assignedToName || "",
+    phone: t.assignedToPhone || "",
+    assignedAt: t.assignedAt || null,
+    claimToken: t.claimToken || null,
+    claimUrl: t.claimToken ? claimUrlFor(t.claimToken) : null,
+    claimedAt: t.claimedAt || null,
+  };
+}
+
+/**
+ * Carga el ticket de :ticketId comprobando que es del usuario y que no está usado.
+ * Devuelve { ticket } o { status, body } con el error a responder.
+ */
+async function loadOwnTicketForAssignment(req, logTag) {
+  const { ticketId } = req.params;
+  if (!mongoose.isValidObjectId(ticketId)) {
+    return { status: 400, body: { error: "invalid_id", message: "ID de entrada inválido" } };
+  }
+
+  const ticket = await Ticket.findById(ticketId)
+    .select("_id status ownerUserId email claimToken")
+    .lean();
+  if (!ticket) {
+    return { status: 404, body: { error: "not_found", message: "Entrada no encontrada" } };
+  }
+
+  // ⚠️ Propiedad: mismo criterio que /my-tickets/full y /my-tickets/:ticketId/qr.
+  if (!isTicketOwner(ticket, ticketOwnerFromRequest(req))) {
+    console.warn(`[${logTag}] acceso denegado`, {
+      ticketId: String(ticket._id),
+      userId: req.user?.id || null,
+    });
+    return { status: 403, body: { error: "forbidden", message: "Esta entrada no es tuya" } };
+  }
+
+  if (ticket.status === "checked_in") {
+    return { status: 409, body: { error: "already_used", message: "Esta entrada ya se ha usado" } };
+  }
+
+  return { ticket };
+}
+
 /**
  * Precio unitario (EUR) de una entrada, por orden de preferencia:
  * 1) priceEUR del tier del evento, 2) unitAmount (céntimos) del item de la orden
@@ -1698,7 +1775,10 @@ router.get("/my-tickets/full", anyAuth, ensureUserId, async (req, res) => {
     const or = ownerFilter.$or;
 
     const tickets = await Ticket.find({ $or: or })
-      .select("_id eventId orderId serial status issuedAt checkedInAt ticketTypeId")
+      .select(
+        "_id eventId orderId serial status issuedAt checkedInAt ticketTypeId " +
+          "assignedToName assignedToPhone assignedAt claimToken claimedAt"
+      )
       .lean();
     if (!tickets.length) return res.json([]);
 
@@ -1786,6 +1866,8 @@ router.get("/my-tickets/full", anyAuth, ensureUserId, async (req, res) => {
               qty: ord.qty || 1,
             }
           : null,
+        // Entrada asignada a un acompañante (claimToken/claimUrl SOLO aquí: ruta del propietario)
+        assignment: assignmentView(t),
       };
     });
 
@@ -1851,6 +1933,199 @@ router.get("/my-tickets/:ticketId/qr", anyAuth, ensureUserId, async (req, res) =
   } catch (err) {
     console.error("[GET /events/my-tickets/:ticketId/qr] error:", err);
     return res.status(500).json({ message: "Error generando el QR" });
+  }
+});
+
+/* ------------------------------------------------------------------
+   ASIGNAR UNA ENTRADA A UN ACOMPAÑANTE (solo su dueño)
+   POST /api/events/my-tickets/:ticketId/assign  { name, phone }
+     -> { ok, claimToken, claimUrl, assignedToName }
+   ANTES de "/:id". Si ya había claimToken se CONSERVA: el enlace ya
+   compartido sigue valiendo tras cambiar el nombre.
+------------------------------------------------------------------- */
+router.post("/my-tickets/:ticketId/assign", anyAuth, ensureUserId, async (req, res) => {
+  try {
+    const loaded = await loadOwnTicketForAssignment(req, "POST /events/my-tickets/:ticketId/assign");
+    if (!loaded.ticket) return res.status(loaded.status).json(loaded.body);
+    const { ticket } = loaded;
+
+    if (ticket.status === "refunded") {
+      return res.status(409).json({ error: "refunded", message: "Esta entrada está reembolsada" });
+    }
+
+    const body = req.body || {};
+    const name = typeof body.name === "string" ? body.name.trim().replace(/\s+/g, " ") : "";
+    if (!name) {
+      return res.status(400).json({ error: "missing_name", message: "Falta el nombre" });
+    }
+    if (name.length > 80) {
+      return res.status(400).json({ error: "name_too_long", message: "El nombre es demasiado largo" });
+    }
+    const phone = typeof body.phone === "string" ? normalizePhoneLoose(body.phone) : "";
+
+    const claimToken = ticket.claimToken || newClaimToken();
+
+    // Atómico: solo si sigue sin usar y nadie ha cambiado el claimToken entretanto
+    // (dos asignaciones a la vez no deben generar dos enlaces distintos).
+    const updated = await Ticket.findOneAndUpdate(
+      { _id: ticket._id, status: "issued", claimToken: ticket.claimToken || null },
+      {
+        $set: {
+          assignedToName: name,
+          assignedToPhone: phone,
+          assignedAt: new Date(),
+          claimToken,
+        },
+      },
+      { new: true }
+    )
+      .select("claimToken assignedToName")
+      .lean();
+
+    if (!updated) {
+      const fresh = await Ticket.findById(ticket._id).select("status").lean();
+      if (fresh?.status === "checked_in") {
+        return res.status(409).json({ error: "already_used", message: "Esta entrada ya se ha usado" });
+      }
+      if (fresh?.status === "refunded") {
+        return res.status(409).json({ error: "refunded", message: "Esta entrada está reembolsada" });
+      }
+      return res.status(409).json({ error: "conflict", message: "La entrada ha cambiado, inténtalo de nuevo" });
+    }
+
+    return res.json({
+      ok: true,
+      claimToken: updated.claimToken,
+      claimUrl: claimUrlFor(updated.claimToken),
+      assignedToName: updated.assignedToName,
+    });
+  } catch (err) {
+    console.error("[POST /events/my-tickets/:ticketId/assign] error:", err);
+    return res.status(500).json({ message: "Error asignando la entrada" });
+  }
+});
+
+/* ------------------------------------------------------------------
+   QUITAR LA ASIGNACIÓN (solo su dueño)
+   DELETE /api/events/my-tickets/:ticketId/assign -> { ok }
+   Borra el claimToken: el enlace antiguo deja de valer.
+------------------------------------------------------------------- */
+router.delete("/my-tickets/:ticketId/assign", anyAuth, ensureUserId, async (req, res) => {
+  try {
+    const loaded = await loadOwnTicketForAssignment(req, "DELETE /events/my-tickets/:ticketId/assign");
+    if (!loaded.ticket) return res.status(loaded.status).json(loaded.body);
+
+    // Atómico: no se toca una entrada que se haya usado entretanto.
+    const result = await Ticket.updateOne(
+      { _id: loaded.ticket._id, status: { $ne: "checked_in" } },
+      {
+        $set: {
+          assignedToName: "",
+          assignedToPhone: "",
+          assignedAt: null,
+          claimToken: null,
+          // El enlace nuevo (si se reasigna) aún no lo ha abierto nadie
+          claimedAt: null,
+          claimedByUserId: null,
+        },
+      }
+    );
+
+    if (!(result.n ?? result.matchedCount)) {
+      return res.status(409).json({ error: "already_used", message: "Esta entrada ya se ha usado" });
+    }
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("[DELETE /events/my-tickets/:ticketId/assign] error:", err);
+    return res.status(500).json({ message: "Error quitando la asignación" });
+  }
+});
+
+/* ------------------------------------------------------------------
+   ENLACE DEL ACOMPAÑANTE (PÚBLICO, sin autenticación)
+   GET /api/tickets/claim/:claimToken  — montado en index.js como
+   app.use("/api/tickets", eventRoutes.ticketClaimRouter).
+   ⚠️ Solo lo imprescindible para enseñar la entrada: nada del comprador,
+   de la orden ni ids internos.
+------------------------------------------------------------------- */
+const ticketClaimRouter = express.Router();
+
+const claimLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minuto
+  max: 60,             // 60 peticiones por IP/min
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (_req, res) => res.status(429).json({ ok: false, reason: "rate_limited" }),
+});
+
+ticketClaimRouter.get("/claim/:claimToken", claimLimiter, async (req, res) => {
+  // El QR da acceso al evento: que nadie lo guarde en caché.
+  res.set("Cache-Control", "no-store");
+  const notFound = () => res.status(404).json({ ok: false, reason: "not_found" });
+
+  try {
+    const claimToken = String(req.params.claimToken || "");
+    if (!/^[A-Za-z0-9_-]{16,64}$/.test(claimToken)) return notFound();
+
+    const ticket = await Ticket.findOne({ claimToken })
+      .select("_id serial status eventId orderId ticketTypeId assignedToName claimedAt")
+      .lean();
+    // Reembolsada: mismo 404, sin dar detalles
+    if (!ticket || ticket.status === "refunded" || !ticket.serial) return notFound();
+
+    const ev = mongoose.isValidObjectId(String(ticket.eventId))
+      ? await Event.findById(ticket.eventId)
+          .select("title image startAt date city street ticketTiers.tierId ticketTiers.name club createdBy")
+          .lean()
+      : null;
+
+    // tierName: tier del evento; si no, el de la orden (sin devolver nada más de ella)
+    const tier = ticket.ticketTypeId
+      ? (ev?.ticketTiers || []).find((x) => x.tierId === ticket.ticketTypeId)
+      : null;
+    let tierName = tier?.name || "";
+    if (!tierName && ticket.orderId) {
+      const ord = await Order.findById(ticket.orderId).select("tierName").lean();
+      tierName = ord?.tierName || "";
+    }
+
+    // Nombre del club: mismo criterio que /my-tickets/full (Club por event.club; si no, el User creador)
+    let clubName = "";
+    if (ev?.club) {
+      const c = await Club.findById(ev.club).select("name").lean();
+      clubName = c?.name || "";
+    }
+    if (!clubName && ev?.createdBy) {
+      const u = await User.findById(ev.createdBy).select("entityName entName displayName username").lean();
+      clubName = u?.entityName || u?.entName || u?.displayName || u?.username || "";
+    }
+
+    // Primera apertura del enlace
+    if (!ticket.claimedAt) {
+      await Ticket.updateOne({ _id: ticket._id, claimedAt: null }, { $set: { claimedAt: new Date() } });
+    }
+
+    const serial = ticket.serial;
+    return res.json({
+      ok: true,
+      serial,
+      qrPayload: JSON.stringify({ serial, token: makeToken(serial) }),
+      status: ticket.status, // 'issued' | 'checked_in'
+      assignedToName: ticket.assignedToName || "",
+      tierName,
+      event: {
+        title: ev?.title || "",
+        startAt: ev?.startAt || ev?.date || null,
+        city: ev?.city || "",
+        street: ev?.street || "",
+        imageUrl: ev ? absUrlFromUpload(req, ev.image) : null,
+      },
+      club: { name: clubName },
+    });
+  } catch (err) {
+    console.error("[GET /tickets/claim/:claimToken] error:", err?.message || err);
+    return res.status(500).json({ ok: false, reason: "server_error" });
   }
 });
 
@@ -3202,3 +3477,5 @@ router.post("/:id/image", anyAuth, ensureUserId, upload.single("image"), async (
 });
 
 module.exports = router;
+// Enlace público del acompañante: index.js lo monta en /api/tickets
+module.exports.ticketClaimRouter = ticketClaimRouter;

@@ -11,7 +11,21 @@ const TicketSchema = new mongoose.Schema({
   status: { type: String, enum: ['issued','checked_in','refunded'], default: 'issued' },
   issuedAt: { type: Date, default: Date.now },
   checkedInAt: { type: Date, default: null },
-  checkedInBy: { type: String, default: null }
+  checkedInBy: { type: String, default: null },
+
+  // Asignación a un acompañante (el comprador conserva la custodia)
+  assignedToName:  { type: String, default: '' },
+  assignedToPhone: { type: String, default: '' },
+  assignedAt:      { type: Date, default: null },
+
+  // Token de reclamación: va en el enlace que se comparte.
+  // Impredecible, único, y lo único que necesita el acompañante para ver
+  // su entrada.
+  claimToken:      { type: String, default: null, index: true, sparse: true },
+
+  // Cuando el acompañante abre el enlace / instala la app
+  claimedAt:       { type: Date, default: null },
+  claimedByUserId: { type: String, default: null }
 }, { timestamps: true });
 
 // "Mis entradas": búsquedas por propietario y por email del comprador

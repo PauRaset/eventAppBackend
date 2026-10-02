@@ -131,6 +131,7 @@ const staticAllowed = new Set([
   "http://localhost:3000",
   "https://clubs.nightvibe.life",
   "https://nvclubs.vercel.app",
+  "https://nightvibe.life", // web pública (dominio desnudo): /t/<claimToken>
 ]);
 
 function isAllowedOrigin(origin) {
@@ -1169,6 +1170,7 @@ app.post("/api/registration/requests", (req, res, next) => {
 app.use("/api/auth", authRoutes);
 app.use("/api/users", userRoutes);
 app.use("/api/events", eventRoutes);
+app.use("/api/tickets", eventRoutes.ticketClaimRouter); // GET /api/tickets/claim/:claimToken (público)
 app.use("/api/promotions", promotionsRoutes);
 app.use("/api/notifications", notificationRoutes);
 app.use("/api/push", pushRoutes);

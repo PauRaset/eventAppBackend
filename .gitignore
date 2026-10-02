@@ -1,6 +1,7 @@
 # Secretos — NUNCA subir
 .env
 .env.*
+!.env.example
 aenv
 arxiuenv
 firebase-service-account.json
