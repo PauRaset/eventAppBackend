@@ -3,8 +3,6 @@ require("dotenv").config();
 const express = require("express");
 const mongoose = require("mongoose");
 const cors = require("cors");
-const session = require("express-session");
-const passport = require("passport");
 const path = require("path");
 const bodyParser = require("body-parser"); // <- para el webhook RAW
 const Stripe = require("stripe");          // <- Stripe SDK
@@ -51,8 +49,9 @@ const admin = require("./middlewares/firebaseAdmin");
 console.log("firebase-admin project:", admin.app().options.credential?.projectId || process.env.FIREBASE_PROJECT_ID || "(desconocido)");
 
 const app = express();
-// Si estamos detrás de un proxy (Vercel/NGINX), esto permite que la cookie `secure`
-// funcione correctamente en producción.
+// Detrás de nginx: confiar en el primer proxy para que req.ip sea la IP real del
+// cliente (X-Forwarded-For). Lo necesita express-rate-limit para limitar por IP;
+// sin esto todas las peticiones parecerían venir de la misma IP (la de nginx).
 if (process.env.NODE_ENV === 'production') {
   app.set('trust proxy', 1);
 }
@@ -64,7 +63,6 @@ if (process.env.NODE_ENV === 'production') {
     'STRIPE_SECRET_KEY',
     'STRIPE_WEBHOOK_SECRET',
     'MONGO_URI',
-    'SESSION_SECRET',
     'QR_HMAC_KEY',
   ]) {
     if (!process.env[key]) missing.push(key);
@@ -120,28 +118,29 @@ try {
 }
 
 // ============================================================================
-//   CORS — permitir clubs.nightvibe.life, previews de Vercel y FRONTEND_URL
+//   CORS — lista cerrada de orígenes (sin comodín *.vercel.app: con
+//   credentials:true permitiría a cualquier despliegue de Vercel llamar a la API)
 // ============================================================================
 const FRONTEND_URL = (process.env.FRONTEND_URL || "").replace(/\/+$/, "");
 
 const staticAllowed = new Set([
-  FRONTEND_URL,
-  "https://event-app-prod.vercel.app",
-  "https://nightvibe-six.vercel.app",
-  "http://localhost:3000",
-  "https://clubs.nightvibe.life",
-  "https://nvclubs.vercel.app",
-  "https://nightvibe.life", // web pública (dominio desnudo): /t/<claimToken>
-]);
+  FRONTEND_URL,                        // si está definida
+  "https://nightvibe.life",            // web pública (páginas /t/<token>)
+  "https://clubs.nightvibe.life",      // portal de clubs, dominio propio
+  "https://nvclubs.vercel.app",        // portal de clubs, Vercel
+  "https://nvclubs-test.vercel.app",   // portal de pruebas
+  // Desarrollo local: solo con las rutas de debug activadas, nunca abierto en producción
+  ...(DEBUG_ROUTES_ENABLED ? ["http://localhost:3000"] : []),
+].filter(Boolean));
 
 function isAllowedOrigin(origin) {
   try {
-    if (!origin) return true; // curl / apps nativas
+    if (!origin) return true; // app Flutter, webhooks de Stripe, servidor a servidor
     if (staticAllowed.has(origin)) return true;
 
-    const { hostname } = new URL(origin);
-    if (hostname.endsWith(".vercel.app")) return true;      // previews
-    if (hostname.endsWith(".nightvibe.life")) return true;  // subdominios
+    const { protocol, hostname } = new URL(origin);
+    // Subdominios propios, solo por https
+    if (protocol === "https:" && hostname.endsWith(".nightvibe.life")) return true;
 
     return false;
   } catch {
@@ -296,25 +295,6 @@ app.use((err, _req, res, next) => {
   return next(err);
 });
 app.use("/uploads", express.static(path.join(__dirname, "uploads")));
-
-// ===== Sesiones =====
-app.use(
-  session({
-    secret: process.env.SESSION_SECRET || "mysecretkey",
-    resave: false,
-    saveUninitialized: false,
-    cookie: {
-      secure: process.env.NODE_ENV === "production",
-      httpOnly: true,
-      maxAge: 24 * 60 * 60 * 1000,
-    },
-  })
-);
-
-// ===== Passport (si lo usas) =====
-app.use(passport.initialize());
-app.use(passport.session());
-require("./passportConfig");
 
 // ===== MongoDB =====
 mongoose
@@ -587,7 +567,7 @@ app.post("/api/orders", async (req, res) => {
     console.log("🔎 resolveConnectedAccount:", resolved);
     console.log('💸 Platform fee:', { perTicketCents, qtyTotal, applicationFee, feeLineAdded });
 
-    const successBase = (process.env.FRONTEND_URL || "https://event-app-prod.vercel.app").replace(/\/+$/, "");
+    const successBase = (process.env.FRONTEND_URL || "https://clubs.nightvibe.life").replace(/\/+$/, "");
 
     // Parámetros base del Checkout
     const sessionParams = {

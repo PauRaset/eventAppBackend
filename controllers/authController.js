@@ -3,9 +3,16 @@ const jwt = require("jsonwebtoken");
 const admin = require("../middlewares/firebaseAdmin"); // asegura inicialización
 
 // =============== LOGIN CON FACEBOOK (lo que ya tenías) ===============
+/*
+ * ⚠️ DESACTIVADO (2026-10-02) junto con las rutas /api/auth/facebook y
+ * /api/auth/facebook/callback (routes/authRoutes.js). Nadie entra por Facebook,
+ * y redirigía con el JWT en la URL a https://event-app-prod.vercel.app, un
+ * proyecto de Vercel que se elimina: quien registrara ese nombre recibiría
+ * JWTs válidos.
+
 exports.loginWithFacebook = async (req, res) => {
   try {
-    const { id, name, email, picture } = req.user; // viene de passport
+    const { id, name, email, picture } = req.user; // venía de passport (eliminado 2026-10-02)
 
     let user = await User.findOne({ facebookId: id });
     if (!user) {
@@ -32,6 +39,7 @@ exports.loginWithFacebook = async (req, res) => {
     res.status(500).json({ message: "Error en autenticación con Facebook" });
   }
 };
+*/
 
 // =============== PERFIL DEL USUARIO AUTENTICADO ===============
 exports.getProfile = async (req, res) => {

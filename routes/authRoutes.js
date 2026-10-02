@@ -1,7 +1,6 @@
 // routes/authRoutes.js
 const express = require("express");
 const jwt = require("jsonwebtoken");
-const passport = require("passport");
 const router = express.Router();
 
 const User = require("../models/User");
@@ -331,7 +330,15 @@ router.post("/ensure", anyAuth, ensureUserId, async (req, res) => {
 
 router.post("/firebase", authController.firebaseLogin);
 
-/* -------- Facebook (spectators) mediante Passport -------- */
+/* -------- Facebook (spectators) mediante Passport --------
+ * ⚠️ DESACTIVADO (2026-10-02). Resto de hace dos años: nadie entra por aquí
+ * (la app usa Firebase por teléfono y el portal email + contraseña).
+ * Riesgo: el callback redirigía a https://event-app-prod.vercel.app/?token=<JWT>
+ * y ese proyecto de Vercel se elimina; quien registrara ese nombre recibiría
+ * JWTs válidos. Ver también controllers/authController.js.
+ * Passport se eliminó del proyecto (2026-10-02): este código ya no funcionaría
+ * sin volver a instalarlo y configurar la estrategia.
+
 router.get(
   "/facebook",
   passport.authenticate("facebook", { scope: ["email", "public_profile"] })
@@ -345,6 +352,7 @@ router.get(
   }),
   authController.loginWithFacebook
 );
+*/
 
 /* -------- Perfil del usuario autenticado -------- */
 router.get("/profile", authenticateToken, authController.getProfile);
