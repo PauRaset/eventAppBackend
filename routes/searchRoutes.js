@@ -1,8 +1,20 @@
 // routes/searchRoutes.js
 const express = require("express");
+const rateLimit = require("express-rate-limit");
 const router = express.Router();
 const User = require("../models/User");
 const Event = require("../models/Event");
+const { anyAuthWithId } = require("../middlewares/authMiddleware");
+
+// 30 búsquedas de usuarios por minuto por usuario autenticado (va DESPUÉS de anyAuthWithId)
+const userSearchLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => `u:${req.user.id}`,
+  handler: (_req, res) => res.status(429).json({ message: "Demasiadas búsquedas, espera un momento" }),
+});
 
 // ---- helpers ----
 function escapeRegex(s = "") {
@@ -21,9 +33,10 @@ router.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now() }));
 /* ========================== USERS =========================== */
 /**
  * GET /search/users?q=texto&page=1&pageSize=20
- * Busca por username, email, entName, name o phoneNumber.
+ * Requiere auth. Busca por username, entName o name.
+ * ⚠️ Ni se busca ni se devuelve email ni teléfono: permitiría recorrer la base de usuarios.
  */
-router.get("/users", async (req, res) => {
+router.get("/users", anyAuthWithId, userSearchLimiter, async (req, res) => {
   try {
     const qRaw = (req.query.q || "").toString().trim();
     const { page, pageSize, skip } = getPagination(req);
@@ -36,17 +49,15 @@ router.get("/users", async (req, res) => {
     const match = {
       $or: [
         { username: rx },
-        { email: rx },
         { entName: rx },
         { name: rx },
-        { phoneNumber: rx },
       ],
     };
 
     const [total, items] = await Promise.all([
       User.countDocuments(match),
       User.find(match)
-        .select("username email entName profilePicture role phoneNumber")
+        .select("_id username entName profilePicture role")
         .sort({ username: 1 })
         .skip(skip)
         .limit(pageSize)

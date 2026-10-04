@@ -52,8 +52,8 @@ router.post('/follow/requests/:id/accept', anyAuthWithId, acceptFollowRequest);
 router.post('/follow/requests/:id/reject', anyAuthWithId, rejectFollowRequest);
 
 // ---- Lists ----
-router.get('/users/:id/followers', getFollowers);
-router.get('/users/:id/following', getFollowing);
+router.get('/users/:id/followers', anyAuthWithId, getFollowers); // auth + respeta isPrivate
+router.get('/users/:id/following', anyAuthWithId, getFollowing); // auth + respeta isPrivate
 
 // ---- Stats ----
 router.get('/users/:id/stats', anyAuth, getUserStats);

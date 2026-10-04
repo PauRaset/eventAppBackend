@@ -488,12 +488,39 @@ exports.unfollowUser = async (req, res) => {
 // ———————————————————————————————————————————————————————————————————————
 // Listas
 // ———————————————————————————————————————————————————————————————————————
+const PRIVACY_FIELDS = 'isPrivate privateProfile profilePrivate privacy';
+
+/**
+ * ¿Puede quien hace la petición ver las listas (seguidores/seguidos) de `target`?
+ * Perfil público: sí. Perfil privado: solo él mismo o quien le sigue.
+ * `target.followers` puede venir como ids o ya populado (docs con _id).
+ */
+const canViewSocialLists = async (req, target) => {
+  if (!isPrivateProfile(target)) return true;
+  // El token puede traer uid de Firebase o _id de Mongo: resolvemos al _id
+  const viewer = await resolveUserByKey(pickUserId(req));
+  if (!viewer) return false;
+  const viewerId = String(viewer._id);
+  if (viewerId === String(target._id)) return true;
+  return (target.followers || []).some((f) => String(f?._id ?? f) === viewerId);
+};
+
+// Requiere auth (socialRoutes). Perfil privado: solo lo ve él mismo o quien le sigue.
 exports.getFollowers = async (req, res) => {
   try {
+    if (!isObjectId(req.params.id)) {
+      return res.status(404).json({ message: 'Usuario no encontrado' });
+    }
+
     const u = await User.findById(req.params.id)
-      .select('followers')
+      .select(`followers ${PRIVACY_FIELDS}`)
       .populate('followers', '_id username profilePicture');
     if (!u) return res.status(404).json({ message: 'Usuario no encontrado' });
+
+    if (!(await canViewSocialLists(req, u))) {
+      return res.status(403).json({ message: 'Este perfil es privado' });
+    }
+
     res.json({ count: u.followers.length, followers: u.followers });
   } catch (err) {
     console.error('[getFollowers] error', err);
@@ -501,12 +528,22 @@ exports.getFollowers = async (req, res) => {
   }
 };
 
+// Requiere auth (socialRoutes). Perfil privado: solo lo ve él mismo o quien le sigue.
 exports.getFollowing = async (req, res) => {
   try {
+    if (!isObjectId(req.params.id)) {
+      return res.status(404).json({ message: 'Usuario no encontrado' });
+    }
+
     const u = await User.findById(req.params.id)
-      .select('following')
+      .select(`following followers ${PRIVACY_FIELDS}`)
       .populate('following', '_id username profilePicture');
     if (!u) return res.status(404).json({ message: 'Usuario no encontrado' });
+
+    if (!(await canViewSocialLists(req, u))) {
+      return res.status(403).json({ message: 'Este perfil es privado' });
+    }
+
     res.json({ count: u.following.length, following: u.following });
   } catch (err) {
     console.error('[getFollowing] error', err);
