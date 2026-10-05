@@ -199,6 +199,51 @@ router.get("/me/attending", anyAuth, ensureUserId, async (req, res) => {
 });
 
 /* -------------------------------------------------------------
+   GET /api/users/me/assignable?q=&limit=
+   Selector para asignar una entrada: gente a la que sigo, sin clubs
+   (no tiene sentido darle una entrada a un local).
+   -> { ok, users: [ { _id, username, profilePictureUrl } ] }
+------------------------------------------------------------- */
+router.get("/me/assignable", anyAuth, ensureUserId, async (req, res) => {
+  try {
+    const me = await User.findById(req.user.id).select("_id following").lean();
+    if (!me) return res.status(404).json({ ok: false, message: "Usuario no encontrado" });
+
+    const followingIds = (Array.isArray(me.following) ? me.following : [])
+      .map(String)
+      .filter((id) => id !== String(me._id));
+    if (!followingIds.length) return res.json({ ok: true, users: [] });
+
+    const limitRaw = parseInt(req.query.limit, 10);
+    const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 1), 100) : 50;
+
+    const filter = { _id: { $in: followingIds }, role: { $ne: "club" } };
+    const q = (req.query.q || "").toString().trim().replace(/^@/, "").slice(0, 50);
+    if (q) {
+      filter.username = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+    }
+
+    const users = await User.find(filter)
+      .select("_id username profilePicture")
+      .sort({ username: 1 })
+      .limit(limit)
+      .lean();
+
+    return res.json({
+      ok: true,
+      users: users.map((u) => ({
+        _id: String(u._id),
+        username: u.username || "",
+        profilePictureUrl: absUrlFromUpload(req, u.profilePicture),
+      })),
+    });
+  } catch (err) {
+    console.error("[GET /users/me/assignable] error:", err);
+    return res.status(500).json({ ok: false, message: "Error obteniendo usuarios" });
+  }
+});
+
+/* -------------------------------------------------------------
    GET /api/users/me  (JWT o Firebase)
 ------------------------------------------------------------- */
 router.get("/me", anyAuth, ensureUserId, async (req, res) => {

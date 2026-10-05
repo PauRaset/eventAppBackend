@@ -1578,12 +1578,15 @@ router.get("/my-tickets", optionalUserId, async (req, res) => {
     const buyerIds = [req.firebaseUser?.uid, req.user?.id].filter(Boolean);
     if (buyerIds.length === 0) return res.json({ eventIds: [] });
 
-    const ids = await Order.distinct("eventId", {
-      userId: { $in: buyerIds },
-      status: "paid",
-    });
+    // Tiene entrada si la compró (Order pagada) O si se la han asignado (Ticket)
+    const [orderEventIds, assignedEventIds] = await Promise.all([
+      Order.distinct("eventId", { userId: { $in: buyerIds }, status: "paid" }),
+      Ticket.distinct("eventId", { assignedToUserId: { $in: buyerIds }, status: { $ne: "refunded" } }),
+    ]);
 
-    const eventIds = (ids || []).map((x) => String(x)).filter(Boolean);
+    const eventIds = [
+      ...new Set([...(orderEventIds || []), ...(assignedEventIds || [])].map((x) => String(x)).filter(Boolean)),
+    ];
     return res.json({ eventIds });
   } catch (err) {
     console.error("[GET /events/my-tickets] error:", err);
@@ -1628,8 +1631,12 @@ function escapeRegExpLiteral(s) {
 
 /**
  * Identidad del usuario para decidir qué entradas son suyas.
- * ÚNICO criterio de propiedad de entradas: lo usan /my-tickets/full (consulta)
- * y /my-tickets/:ticketId/qr (comprobación). No duplicar en otro sitio.
+ * Hay DOS criterios, a propósito separados (no mezclar ni duplicar en otro sitio):
+ *  (b) PROPIEDAD = comprador: ticketOwnerFilter / isTicketOwner.
+ *      Gobierna asignar y quitar la asignación.
+ *  (a) VISIBILIDAD = comprador O destinatario asignado (assignedToUserId):
+ *      ticketViewerFilter / canViewTicket. Gobierna /my-tickets/full y el QR.
+ * ⚠️ Nunca uses (a) para asignar: el destinatario podría reasignar la entrada.
  * - ownerIds: uid de Firebase y _id de Mongo.
  * - verifiedEmail: SOLO el email que Firebase marca como verificado
  *   (User.email se puede cambiar sin verificar en /api/auth/update).
@@ -1654,7 +1661,7 @@ function ticketOwnerFilter(owner) {
   return or.length ? { $or: or } : null;
 }
 
-/** Misma regla que ticketOwnerFilter, aplicada a un ticket ya cargado. */
+/** Misma regla que ticketOwnerFilter, aplicada a un ticket ya cargado. (b) PROPIEDAD: solo el comprador. */
 function isTicketOwner(ticket, owner) {
   if (!ticket) return false;
   if (ticket.ownerUserId && owner.ownerIds.includes(String(ticket.ownerUserId))) return true;
@@ -1666,6 +1673,26 @@ function isTicketOwner(ticket, owner) {
     return true;
   }
   return false;
+}
+
+/** ¿Es el usuario el destinatario asignado de la entrada? (uid de Firebase o _id de Mongo) */
+function isTicketAssignee(ticket, owner) {
+  return !!(ticket?.assignedToUserId && owner.ownerIds.includes(String(ticket.assignedToUserId)));
+}
+
+/**
+ * (a) VISIBILIDAD: ¿puede ver la entrada y mostrar su QR? Comprador o destinatario.
+ * ⚠️ NO usar para asignar/quitar la asignación: eso es isTicketOwner.
+ */
+function canViewTicket(ticket, owner) {
+  return isTicketOwner(ticket, owner) || isTicketAssignee(ticket, owner);
+}
+
+/** Filtro de Mongo de (a): entradas compradas por el usuario + las que le han asignado. */
+function ticketViewerFilter(owner) {
+  const or = [...(ticketOwnerFilter(owner)?.$or || [])];
+  if (owner.ownerIds.length) or.push({ assignedToUserId: { $in: owner.ownerIds } });
+  return or.length ? { $or: or } : null;
 }
 
 /* ------------------------------------------------------------------
@@ -1698,17 +1725,78 @@ function normalizePhoneLoose(raw) {
   return input;
 }
 
-/** Asignación para /my-tickets/full (ruta del propietario), o null si no está asignada. */
+/**
+ * Asignación para /my-tickets/full, SOLO para el comprador (role 'owner'), o null.
+ * userId: destinatario de la app (asignación a usuario) o null (asignación por enlace).
+ */
 function assignmentView(t) {
-  if (!t.claimToken && !t.assignedAt) return null;
+  if (!t.claimToken && !t.assignedAt && !t.assignedToUserId) return null;
   return {
     name: t.assignedToName || "",
     phone: t.assignedToPhone || "",
+    userId: t.assignedToUserId || null,
     assignedAt: t.assignedAt || null,
     claimToken: t.claimToken || null,
     claimUrl: t.claimToken ? claimUrlFor(t.claimToken) : null,
     claimedAt: t.claimedAt || null,
   };
+}
+
+/**
+ * Busca al destinatario de una asignación por _id de Mongo o uid de Firebase
+ * (nunca por teléfono, email ni username).
+ */
+async function findAssignableUser(userId) {
+  const key = typeof userId === "string" ? userId.trim() : "";
+  if (!key) return null;
+  const filter = /^[a-fA-F0-9]{24}$/.test(key) ? { _id: key } : { firebaseUid: key };
+  return User.findOne(filter).select("_id username role firebaseUid").lean();
+}
+
+/**
+ * Notificación (bandeja + push) al destinatario de una entrada asignada.
+ * Mismo patrón que socialController: documento Notification y luego push.
+ * Nunca lanza: un fallo aquí no debe deshacer la asignación.
+ */
+async function notifyTicketAssigned({ req, ticket, recipient }) {
+  try {
+    const buyerId = String(req.user?.id || "");
+    const [buyer, ev] = await Promise.all([
+      mongoose.isValidObjectId(buyerId) ? User.findById(buyerId).select("username").lean() : null,
+      mongoose.isValidObjectId(String(ticket.eventId))
+        ? Event.findById(ticket.eventId).select("_id title image").lean()
+        : null,
+    ]);
+    const buyerName = buyer?.username || "Alguien";
+    const eventTitle = ev?.title || "un evento";
+
+    const notification = await Notification.findOneAndUpdate(
+      { user: recipient._id, type: "ticket_assigned", ticketId: ticket._id },
+      {
+        $set: {
+          title: "Tienes una entrada",
+          body: `${buyerName} te ha dado una entrada para ${eventTitle}`,
+          // Mismo criterio que `event:<id>/photos`: entidad + pestaña
+          routeTarget: `profile:${recipient._id}/tickets`,
+          previewImage: ev ? absUrlFromUpload(req, ev.image) : null,
+          actor: buyer?._id || null,
+          event: ev?._id || null,
+          read: false,
+          readAt: null,
+          pushSent: false,
+          meta: { eventTitle, givenByUsername: buyer?.username || "" },
+        },
+        $setOnInsert: { user: recipient._id, type: "ticket_assigned", ticketId: ticket._id },
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+
+    if (notification?._id) {
+      await sendPushNotificationToUser(recipient._id, notification);
+    }
+  } catch (e) {
+    console.warn("[notifications] notifyTicketAssigned failed:", e?.message || e);
+  }
 }
 
 /**
@@ -1722,13 +1810,14 @@ async function loadOwnTicketForAssignment(req, logTag) {
   }
 
   const ticket = await Ticket.findById(ticketId)
-    .select("_id status ownerUserId email claimToken")
+    .select("_id eventId status ownerUserId email claimToken assignedToUserId")
     .lean();
   if (!ticket) {
     return { status: 404, body: { error: "not_found", message: "Entrada no encontrada" } };
   }
 
-  // ⚠️ Propiedad: mismo criterio que /my-tickets/full y /my-tickets/:ticketId/qr.
+  // ⚠️ (b) PROPIEDAD: solo el COMPRADOR asigna o quita la asignación. NO canViewTicket:
+  // el destinatario puede ver la entrada, pero no reasignarla.
   if (!isTicketOwner(ticket, ticketOwnerFromRequest(req))) {
     console.warn(`[${logTag}] acceso denegado`, {
       ticketId: String(ticket._id),
@@ -1770,17 +1859,48 @@ function ticketUnitPriceEUR(ticket, tier, order) {
 
 router.get("/my-tickets/full", anyAuth, ensureUserId, async (req, res) => {
   try {
-    const ownerFilter = ticketOwnerFilter(ticketOwnerFromRequest(req));
-    if (!ownerFilter) return res.json([]);
-    const or = ownerFilter.$or;
+    // (a) VISIBILIDAD: las que compré + las que me han asignado
+    const owner = ticketOwnerFromRequest(req);
+    const viewerFilter = ticketViewerFilter(owner);
+    if (!viewerFilter) return res.json([]);
 
-    const tickets = await Ticket.find({ $or: or })
+    // ownerUserId/email solo para decidir el papel (isTicketOwner); NO se devuelven.
+    const tickets = await Ticket.find(viewerFilter)
       .select(
-        "_id eventId orderId serial status issuedAt checkedInAt ticketTypeId " +
-          "assignedToName assignedToPhone assignedAt claimToken claimedAt"
+        "_id eventId orderId serial status issuedAt checkedInAt ticketTypeId ownerUserId email " +
+          "assignedToName assignedToPhone assignedToUserId assignedAt claimToken claimedAt"
       )
       .lean();
     if (!tickets.length) return res.json([]);
+
+    // Papel de cada entrada: 'owner' (la compré yo) o 'assigned' (me la han dado)
+    const roleById = new Map(
+      tickets.map((t) => [String(t._id), isTicketOwner(t, owner) ? "owner" : "assigned"])
+    );
+
+    // Quién me dio las asignadas: username del comprador (ownerUserId = uid de Firebase o _id)
+    const giverKeys = [
+      ...new Set(
+        tickets
+          .filter((t) => roleById.get(String(t._id)) === "assigned" && t.ownerUserId)
+          .map((t) => String(t.ownerUserId))
+      ),
+    ];
+    const givers = giverKeys.length
+      ? await User.find({
+          $or: [
+            { _id: { $in: giverKeys.filter((k) => /^[a-fA-F0-9]{24}$/.test(k)) } },
+            { firebaseUid: { $in: giverKeys } },
+          ],
+        })
+          .select("_id firebaseUid username")
+          .lean()
+      : [];
+    const giverNameByKey = new Map();
+    for (const g of givers) {
+      giverNameByKey.set(String(g._id), g.username || "");
+      if (g.firebaseUid) giverNameByKey.set(String(g.firebaseUid), g.username || "");
+    }
 
     // --- Carga en bloque: eventos, órdenes y clubs ---
     const eventIds = [...new Set(tickets.map((t) => String(t.eventId)).filter(mongoose.isValidObjectId))];
@@ -1834,10 +1954,17 @@ router.get("/my-tickets/full", anyAuth, ensureUserId, async (req, res) => {
         (ev?.createdBy && ownerNameById.get(String(ev.createdBy))) ||
         "";
 
+      const role = roleById.get(String(t._id));
+      const isOwnerRole = role === "owner";
+
       return {
         _sortStart: startMs,
         _upcoming: !ended,
         ticketId: String(t._id),
+        role, // 'owner' = la compré yo | 'assigned' = me la han dado
+        givenBy: isOwnerRole
+          ? null
+          : { username: (t.ownerUserId && giverNameByKey.get(String(t.ownerUserId))) || "" },
         serial: t.serial,
         status: t.status,
         state,
@@ -1858,7 +1985,8 @@ router.get("/my-tickets/full", anyAuth, ensureUserId, async (req, res) => {
         club: clubName ? { name: clubName } : null,
         // amountEUR es el total de la orden (qty entradas), sin la comisión.
         // unitAmountEUR es el precio de ESTA entrada.
-        order: ord
+        // Solo para el comprador: lo que pagó no es asunto del destinatario.
+        order: ord && isOwnerRole
           ? {
               amountEUR: ord.amountEUR ?? null,
               unitAmountEUR: ticketUnitPriceEUR(t, tier, ord),
@@ -1866,8 +1994,8 @@ router.get("/my-tickets/full", anyAuth, ensureUserId, async (req, res) => {
               qty: ord.qty || 1,
             }
           : null,
-        // Entrada asignada a un acompañante (claimToken/claimUrl SOLO aquí: ruta del propietario)
-        assignment: assignmentView(t),
+        // Asignación (claimToken/claimUrl incluidos) SOLO para el comprador
+        assignment: isOwnerRole ? assignmentView(t) : null,
       };
     });
 
@@ -1906,12 +2034,12 @@ router.get("/my-tickets/:ticketId/qr", anyAuth, ensureUserId, async (req, res) =
     }
 
     const ticket = await Ticket.findById(ticketId)
-      .select("_id serial status ownerUserId email")
+      .select("_id serial status ownerUserId email assignedToUserId")
       .lean();
     if (!ticket) return res.status(404).json({ message: "Entrada no encontrada" });
 
-    // ⚠️ Propiedad: mismo criterio que /my-tickets/full (ticketOwnerFromRequest).
-    if (!isTicketOwner(ticket, ticketOwnerFromRequest(req))) {
+    // ⚠️ (a) VISIBILIDAD: comprador o destinatario asignado, como /my-tickets/full.
+    if (!canViewTicket(ticket, ticketOwnerFromRequest(req))) {
       console.warn("[GET /events/my-tickets/:ticketId/qr] acceso denegado", {
         ticketId: String(ticket._id),
         userId: req.user?.id || null,
@@ -1936,14 +2064,103 @@ router.get("/my-tickets/:ticketId/qr", anyAuth, ensureUserId, async (req, res) =
   }
 });
 
+/** Respuesta 409 coherente cuando el update atómico no encuentra la entrada en 'issued'. */
+async function assignmentConflict(res, ticketId) {
+  const fresh = await Ticket.findById(ticketId).select("status").lean();
+  if (fresh?.status === "checked_in") {
+    return res.status(409).json({ error: "already_used", message: "Esta entrada ya se ha usado" });
+  }
+  if (fresh?.status === "refunded") {
+    return res.status(409).json({ error: "refunded", message: "Esta entrada está reembolsada" });
+  }
+  return res.status(409).json({ error: "conflict", message: "La entrada ha cambiado, inténtalo de nuevo" });
+}
+
+/**
+ * Asignación a un USUARIO de la app ({ userId }). Sin enlace: el destinatario la
+ * ve en su perfil. Sustituye cualquier asignación previa (enlace o usuario):
+ * el claimToken anterior deja de valer.
+ */
+async function assignToAppUser(req, res, ticket) {
+  const recipient = await findAssignableUser(req.body.userId);
+  if (!recipient) {
+    return res.status(404).json({ error: "user_not_found", message: "Usuario no encontrado" });
+  }
+  if (recipient.role === "club") {
+    return res.status(400).json({ error: "cannot_assign_to_club", message: "No se puede asignar una entrada a un club" });
+  }
+  const owner = ticketOwnerFromRequest(req);
+  if (
+    owner.ownerIds.includes(String(recipient._id)) ||
+    (recipient.firebaseUid && owner.ownerIds.includes(String(recipient.firebaseUid)))
+  ) {
+    return res.status(400).json({ error: "cannot_assign_to_self", message: "Esta entrada ya es tuya" });
+  }
+
+  const recipientId = String(recipient._id);
+
+  // Solo a quien sigues (como el selector /api/users/me/assignable): evita mandar
+  // notificaciones push a desconocidos cambiando de destinatario.
+  const buyer = mongoose.isValidObjectId(String(req.user?.id || ""))
+    ? await User.findById(req.user.id).select("following").lean()
+    : null;
+  const follows = (buyer?.following || []).some((f) => String(f) === recipientId);
+  if (!follows) {
+    return res.status(403).json({ error: "not_following", message: "Solo puedes asignar entradas a gente que sigues" });
+  }
+  const updated = await Ticket.findOneAndUpdate(
+    { _id: ticket._id, status: "issued" },
+    {
+      $set: {
+        assignedToUserId: recipientId,
+        assignedToName: recipient.username || "",
+        assignedToPhone: "",
+        assignedAt: new Date(),
+        // Sin enlace: si había uno (asignación por enlace), deja de valer
+        claimToken: null,
+        claimedAt: null,
+        claimedByUserId: null,
+      },
+    },
+    { new: true }
+  )
+    .select("_id eventId assignedToUserId assignedToName")
+    .lean();
+
+  if (!updated) return assignmentConflict(res, ticket._id);
+
+  // Solo se avisa si cambia el destinatario (no en cada reintento)
+  if (String(ticket.assignedToUserId || "") !== recipientId) {
+    await notifyTicketAssigned({ req, ticket: updated, recipient });
+  }
+
+  return res.json({
+    ok: true,
+    assignedToUserId: updated.assignedToUserId,
+    assignedToName: updated.assignedToName,
+  });
+}
+
 /* ------------------------------------------------------------------
-   ASIGNAR UNA ENTRADA A UN ACOMPAÑANTE (solo su dueño)
-   POST /api/events/my-tickets/:ticketId/assign  { name, phone }
-     -> { ok, claimToken, claimUrl, assignedToName }
-   ANTES de "/:id". Si ya había claimToken se CONSERVA: el enlace ya
-   compartido sigue valiendo tras cambiar el nombre.
+   ASIGNAR UNA ENTRADA (solo su COMPRADOR: isTicketOwner)
+   POST /api/events/my-tickets/:ticketId/assign
+     { userId }      -> a un usuario de la app: { ok, assignedToUserId, assignedToName }
+     { name, phone } -> por enlace: { ok, claimToken, claimUrl, assignedToName }
+   ANTES de "/:id". Por enlace: si ya había claimToken se CONSERVA (el enlace ya
+   compartido sigue valiendo tras cambiar el nombre).
 ------------------------------------------------------------------- */
-router.post("/my-tickets/:ticketId/assign", anyAuth, ensureUserId, async (req, res) => {
+// 20 asignaciones por hora y usuario (va DESPUÉS de ensureUserId: cuenta por req.user.id)
+const assignLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => `u:${req.user.id}`,
+  handler: (_req, res) =>
+    res.status(429).json({ error: "rate_limited", message: "Demasiadas asignaciones, inténtalo más tarde" }),
+});
+
+router.post("/my-tickets/:ticketId/assign", anyAuth, ensureUserId, assignLimiter, async (req, res) => {
   try {
     const loaded = await loadOwnTicketForAssignment(req, "POST /events/my-tickets/:ticketId/assign");
     if (!loaded.ticket) return res.status(loaded.status).json(loaded.body);
@@ -1954,6 +2171,10 @@ router.post("/my-tickets/:ticketId/assign", anyAuth, ensureUserId, async (req, r
     }
 
     const body = req.body || {};
+    if (body.userId !== undefined && body.userId !== null) {
+      return await assignToAppUser(req, res, ticket);
+    }
+
     const name = typeof body.name === "string" ? body.name.trim().replace(/\s+/g, " ") : "";
     if (!name) {
       return res.status(400).json({ error: "missing_name", message: "Falta el nombre" });
@@ -1975,6 +2196,8 @@ router.post("/my-tickets/:ticketId/assign", anyAuth, ensureUserId, async (req, r
           assignedToPhone: phone,
           assignedAt: new Date(),
           claimToken,
+          // Por enlace sustituye a una asignación previa a un usuario de la app
+          assignedToUserId: null,
         },
       },
       { new: true }
@@ -1982,16 +2205,7 @@ router.post("/my-tickets/:ticketId/assign", anyAuth, ensureUserId, async (req, r
       .select("claimToken assignedToName")
       .lean();
 
-    if (!updated) {
-      const fresh = await Ticket.findById(ticket._id).select("status").lean();
-      if (fresh?.status === "checked_in") {
-        return res.status(409).json({ error: "already_used", message: "Esta entrada ya se ha usado" });
-      }
-      if (fresh?.status === "refunded") {
-        return res.status(409).json({ error: "refunded", message: "Esta entrada está reembolsada" });
-      }
-      return res.status(409).json({ error: "conflict", message: "La entrada ha cambiado, inténtalo de nuevo" });
-    }
+    if (!updated) return assignmentConflict(res, ticket._id);
 
     return res.json({
       ok: true,
@@ -2022,6 +2236,7 @@ router.delete("/my-tickets/:ticketId/assign", anyAuth, ensureUserId, async (req,
         $set: {
           assignedToName: "",
           assignedToPhone: "",
+          assignedToUserId: null,
           assignedAt: null,
           claimToken: null,
           // El enlace nuevo (si se reasigna) aún no lo ha abierto nadie
@@ -2139,13 +2354,15 @@ router.get("/:id/has-ticket", optionalUserId, async (req, res) => {
     const buyerIds = [req.firebaseUser?.uid, req.user?.id].filter(Boolean);
     if (buyerIds.length === 0) return res.json({ hasTicket: false });
 
-    const order = await Order.findOne({
-      eventId,
-      userId: { $in: buyerIds },
-      status: "paid",
-    }).select("_id").lean();
+    // Tiene entrada si la compró (Order pagada) O si se la han asignado (Ticket)
+    const [order, assigned] = await Promise.all([
+      Order.findOne({ eventId, userId: { $in: buyerIds }, status: "paid" }).select("_id").lean(),
+      Ticket.findOne({ eventId, assignedToUserId: { $in: buyerIds }, status: { $ne: "refunded" } })
+        .select("_id")
+        .lean(),
+    ]);
 
-    return res.json({ hasTicket: !!order });
+    return res.json({ hasTicket: !!(order || assigned) });
   } catch (err) {
     console.error("[GET /events/:id/has-ticket] error:", err);
     return res.status(500).json({ hasTicket: false });

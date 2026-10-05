@@ -26,6 +26,7 @@ const notificationSchema = new mongoose.Schema(
         'promotion_reward_claimed',
         'promotion_reward',
         'ticket_confirmed',
+        'ticket_assigned',
       ],
       index: true,
     },

@@ -18,6 +18,10 @@ const TicketSchema = new mongoose.Schema({
   assignedToPhone: { type: String, default: '' },
   assignedAt:      { type: Date, default: null },
 
+  // Usuario de la app al que se ha asignado la entrada (_id de Mongo).
+  // Puede verla y mostrar su QR, pero NO reasignarla: eso solo el comprador.
+  assignedToUserId: { type: String, default: null, index: true },
+
   // Token de reclamación: va en el enlace que se comparte.
   // Impredecible, único, y lo único que necesita el acompañante para ver
   // su entrada.
