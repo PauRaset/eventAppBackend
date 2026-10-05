@@ -8,6 +8,7 @@ const sharp = require("sharp");
 
 const User = require("../models/User");
 const Event = require("../models/Event");
+const jwt = require("jsonwebtoken");
 const authenticateToken = require("../middlewares/authMiddleware");
 
 // Inicializa firebase-admin (igual que en eventRoutes)
@@ -75,28 +76,42 @@ async function anyAuth(req, res, next) {
     return authenticateToken(req, res, next);
   }
 }
-// Variante "opcional": intenta auth pero no bloquea si no hay token o es inválido.
+// Variante "opcional": identifica al usuario si puede, pero NUNCA corta la petición.
+// Sin token, token inválido o caducado -> sigue como anónimo (sin req.user).
+// (Antes delegaba en authenticateToken, que respondía 401/403 con un token inválido.)
 async function optionalAnyAuth(req, res, next) {
+  // 1) Firebase ID token
   const token = extractIdToken(req);
-  if (!token) return next();
-
-  try {
-    const decoded = await admin.auth().verifyIdToken(token);
-    req.firebaseUser = {
-      uid: decoded.uid,
-      phone: decoded.phone_number || decoded.phoneNumber || null,
-      displayName: decoded.name || null,
-      photoURL: decoded.picture || null,
-    };
-    return next();
-  } catch (_) {
-    // Si no era Firebase válido, intenta JWT, pero sin bloquear si falla.
+  if (token) {
     try {
-      return authenticateToken(req, res, next);
-    } catch (e) {
+      const decoded = await admin.auth().verifyIdToken(token);
+      req.firebaseUser = {
+        uid: decoded.uid,
+        phone: decoded.phone_number || decoded.phoneNumber || null,
+        displayName: decoded.name || null,
+        photoURL: decoded.picture || null,
+      };
       return next();
+    } catch (_) {
+      // no era Firebase válido -> probamos JWT propio
     }
   }
+
+  // 2) JWT propio: mismas fuentes y mismo id que authenticateToken, pero sin responder error
+  try {
+    const jwtToken = authenticateToken.extractJwtFromRequest(req);
+    if (jwtToken && process.env.JWT_SECRET) {
+      const decoded = jwt.verify(jwtToken, process.env.JWT_SECRET);
+      const id = decoded.id ?? decoded._id ?? decoded.userId ?? decoded.sub ?? decoded.uid;
+      if (id) {
+        req.user = { ...(req.user || {}), ...decoded, id: String(id) };
+        req.userId = String(id);
+      }
+    }
+  } catch (_) {
+    // token inválido o caducado: anónimo
+  }
+  return next();
 }
 
 // Garantiza req.user.id (ObjectId string de Mongo)
@@ -344,11 +359,20 @@ router.post("/me/avatar", anyAuth, ensureUserId, upload.single("avatar"), async 
    GET /api/users/:id/moments
    Fotos aprobadas subidas por un usuario en eventos/clubs.
 ------------------------------------------------------------- */
-async function resolveUserByAnyId(id) {
+/**
+ * Filtro para buscar un usuario por id público: _id de Mongo, uid de Firebase o username.
+ * ⚠️ NUNCA por teléfono ni email: permitiría comprobar si un número tiene cuenta y de quién es.
+ */
+function userKeyFilter(id) {
+  const key = String(id || "");
   const or = [];
-  if (/^[a-fA-F0-9]{24}$/.test(id)) or.push({ _id: id });
-  or.push({ firebaseUid: id }, { username: id }, { phoneNumber: id });
-  return User.findOne({ $or: or }).lean();
+  if (/^[a-fA-F0-9]{24}$/.test(key)) or.push({ _id: key });
+  or.push({ firebaseUid: key }, { username: key });
+  return { $or: or };
+}
+
+async function resolveUserByAnyId(id) {
+  return User.findOne(userKeyFilter(id)).lean();
 }
 
 async function resolveViewerMongoId(req) {
@@ -638,12 +662,7 @@ router.get('/:id/club-moments', optionalAnyAuth, async (req, res) => {
 // GET /api/users/:id/attending  -> lista de eventos donde el usuario asiste
 router.get("/:id/attending", optionalAnyAuth, async (req, res) => {
   try {
-    const id = req.params.id;
-    const or = [];
-    if (/^[a-fA-F0-9]{24}$/.test(id)) or.push({ _id: id });
-    or.push({ firebaseUid: id }, { username: id }, { phoneNumber: id });
-
-    const user = await User.findOne({ $or: or })
+    const user = await User.findOne(userKeyFilter(req.params.id))
       .select("_id firebaseUid isPrivate followers privacySettings attendancesVisibility")
       .lean();
     if (!user) return res.status(404).json({ message: "Usuario no encontrado" });
@@ -686,18 +705,14 @@ router.get("/:id/attending", optionalAnyAuth, async (req, res) => {
   }
 });
 
-// GET /api/users/:id  -> admite _id Mongo, firebaseUid, username o phoneNumber
+// GET /api/users/:id  -> admite _id Mongo, firebaseUid o username (NO teléfono)
 router.get("/:id", optionalAnyAuth, async (req, res) => {
   try {
     const id = req.params.id;
-    const or = [];
-    if (/^[a-fA-F0-9]{24}$/.test(id)) or.push({ _id: id });
-    or.push({ firebaseUid: id }, { username: id }, { phoneNumber: id });
-
-    const user = await User.findOne({ $or: or })
+    const user = await User.findOne(userKeyFilter(id))
       // Incluimos posibles campos sociales si existen (arrays o counters)
       .select(
-        "username displayName profilePicture followers following followersCount followingCount firebaseUid phoneNumber isPrivate privacySettings attendancesVisibility momentsVisibility locationVisibility"
+        "username displayName profilePicture followers following followersCount followingCount firebaseUid isPrivate privacySettings attendancesVisibility momentsVisibility locationVisibility"
       )
       .lean();
 
@@ -778,34 +793,43 @@ router.get("/:id", optionalAnyAuth, async (req, res) => {
   }
 });
 
+/* -------------------------------------------------------------
+   BATCH DE AVATARES (asistentes de un evento en la app)
+   Requieren auth. Solo aceptan _id de Mongo o uid de Firebase: nada de
+   teléfono ni username como clave (permitía comprobar si un número tiene
+   cuenta y obtener su _id). Solo devuelve lo necesario para pintar un avatar.
+------------------------------------------------------------- */
+const BATCH_MAX_IDS = 100;
+
+async function findUsersForAvatars(req, rawIds) {
+  const ids = [...new Set(rawIds.map((s) => String(s).trim()).filter(Boolean))].slice(0, BATCH_MAX_IDS);
+  if (!ids.length) return [];
+
+  const byObjectId = ids.filter((s) => /^[a-fA-F0-9]{24}$/.test(s));
+  const users = await User.find({
+    $or: [
+      { _id: { $in: byObjectId } },
+      { firebaseUid: { $in: ids } },
+    ],
+  })
+    .select("username displayName profilePicture")
+    .lean();
+
+  return users.map((u) => ({
+    id: String(u._id),
+    username: u.username || "",
+    displayName: u.displayName || "",
+    profilePicture: u.profilePicture || null,
+    avatarUrl: absUrlFromUpload(req, u.profilePicture),
+  }));
+}
+
 // GET /api/users?ids=a,b,c  -> batch por querystring
-router.get("/", async (req, res) => {
+router.get("/", anyAuth, ensureUserId, async (req, res) => {
   try {
     const idsRaw = (req.query.ids || "").toString();
     if (!idsRaw) return res.json([]);
-
-    const ids = idsRaw.split(",").map((s) => s.trim()).filter(Boolean);
-    const byObjectId = ids.filter((s) => /^[a-fA-F0-9]{24}$/.test(s));
-
-    const users = await User.find({
-      $or: [
-        { _id: { $in: byObjectId } },
-        { firebaseUid: { $in: ids } },
-        { username: { $in: ids } },
-        { phoneNumber: { $in: ids } },
-      ],
-    })
-      .select("username displayName profilePicture")
-      .lean();
-
-    const out = users.map((u) => ({
-      id: String(u._id),
-      username: u.username || "",
-      displayName: u.displayName || "",
-      profilePicture: u.profilePicture || null,
-      avatarUrl: absUrlFromUpload(req, u.profilePicture),
-    }));
-    res.json(out);
+    res.json(await findUsersForAvatars(req, idsRaw.split(",")));
   } catch (err) {
     console.error("[GET /users?ids]", err);
     res.status(500).json({ message: "Error interno" });
@@ -813,58 +837,49 @@ router.get("/", async (req, res) => {
 });
 
 // POST /api/users/batch  -> { ids: [...] }
-router.post("/batch", async (req, res) => {
+router.post("/batch", anyAuth, ensureUserId, async (req, res) => {
   try {
-    const ids = Array.isArray(req.body?.ids) ? req.body.ids.map(String) : [];
+    const ids = Array.isArray(req.body?.ids) ? req.body.ids : [];
     if (!ids.length) return res.json([]);
-
-    const byObjectId = ids.filter((s) => /^[a-fA-F0-9]{24}$/.test(s));
-
-    const users = await User.find({
-      $or: [
-        { _id: { $in: byObjectId } },
-        { firebaseUid: { $in: ids } },
-        { username: { $in: ids } },
-        { phoneNumber: { $in: ids } },
-      ],
-    })
-      .select("username displayName profilePicture")
-      .lean();
-
-    const out = users.map((u) => ({
-      id: String(u._id),
-      username: u.username || "",
-      displayName: u.displayName || "",
-      profilePicture: u.profilePicture || null,
-      avatarUrl: absUrlFromUpload(req, u.profilePicture),
-    }));
-    res.json(out);
+    res.json(await findUsersForAvatars(req, ids));
   } catch (err) {
     console.error("[POST /users/batch]", err);
     res.status(500).json({ message: "Error interno" });
   }
 });
 
-// GET /api/users/:id/avatar  -> redirige a la imagen real
+/* -------------------------------------------------------------
+   GET /api/users/:id/avatar  -> redirige a la imagen real
+   ⚠️ SIN auth a propósito: la app la usa directamente como `src` de una
+   imagen (no puede mandar cabeceras).
+   Usuario inexistente y usuario sin avatar devuelven EXACTAMENTE lo mismo
+   (imagen por defecto, 200), para no revelar si una cuenta existe.
+   Los avatares subidos tienen nombre único (avatar-<timestamp>-...), así que
+   basta con cachear la redirección unos minutos.
+------------------------------------------------------------- */
+const DEFAULT_AVATAR_PATH = path.join(__dirname, "..", "assets", "default-avatar.png");
+const AVATAR_CACHE_CONTROL = "public, max-age=300"; // 5 min
+
+function sendDefaultAvatar(res) {
+  res.set("Cache-Control", AVATAR_CACHE_CONTROL);
+  return res.sendFile(DEFAULT_AVATAR_PATH, { cacheControl: false });
+}
+
 router.get("/:id/avatar", async (req, res) => {
   try {
-    const id = req.params.id;
-    const or = [];
-    if (/^[a-fA-F0-9]{24}$/.test(id)) or.push({ _id: id });
-    or.push({ firebaseUid: id }, { username: id }, { phoneNumber: id });
-
-    const user = await User.findOne({ $or: or })
+    const user = await User.findOne(userKeyFilter(req.params.id))
       .select("profilePicture")
       .lean();
 
-    if (!user || !user.profilePicture) return res.status(404).end();
+    const url = user?.profilePicture ? absUrlFromUpload(req, user.profilePicture) : null;
+    if (!url) return sendDefaultAvatar(res);
 
-    const url = absUrlFromUpload(req, user.profilePicture);
-    if (!url) return res.status(404).end();
+    res.set("Cache-Control", AVATAR_CACHE_CONTROL);
     return res.redirect(url);
   } catch (err) {
     console.error("[GET /users/:id/avatar]", err);
-    res.status(500).end();
+    // También aquí la imagen por defecto: un error no debe distinguirse de "sin avatar"
+    return sendDefaultAvatar(res);
   }
 });
 
