@@ -38,6 +38,19 @@ const eventPhotoSchema = new mongoose.Schema(
     // true si se subió por el flujo del QR del local (POST /scan/:token/photo)
     viaQrScan: { type: Boolean, default: false },
 
+    // Validación automática (IA). Independiente de `status`, que sigue siendo la
+    // decisión final: 'needs_review' = la IA no lo tiene claro y debe revisarlo
+    // el club. 'not_run' = aún no se ha pasado (o no aplica, p.ej. foto del muro).
+    // ⚠️ Solo campos: todavía no hay ninguna llamada a IA que los rellene.
+    aiStatus: {
+      type: String,
+      enum: ["not_run", "approved", "rejected", "needs_review"],
+      default: "not_run",
+    },
+    aiReason: { type: String, default: "" },        // por qué, legible
+    aiConfidence: { type: Number, default: null },  // 0..1
+    aiCheckedAt: { type: Date, default: null },
+
     // moderation result metadata saved by the club when approving/rejecting the photo
     validatedForMissionType: { type: String, default: null },
     validatedForMissionId: { type: String, default: null },

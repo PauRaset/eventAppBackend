@@ -36,6 +36,11 @@ const MissionProgressSchema = new Schema(
     // Si requiere aprobación del club
     requiresApproval: { type: Boolean, default: false },
 
+    // Copia del criterio de foto de la plantilla (qué debe verse / qué no vale).
+    // Viaja con la misión para enseñarlo en la app y validar la foto.
+    photoCriteria: { type: String, default: '' },
+    photoCriteriaExclude: { type: String, default: '' },
+
     // Si hay claim asociado (pendiente/aprobado/rechazado)
     claimId: { type: Schema.Types.ObjectId, ref: 'PromotionClaim', default: null },
 
@@ -167,6 +172,8 @@ UserClubPromotionProgressSchema.statics.buildFromTemplates = function ({
             current: 0,
             target: m.target ?? 1,
             requiresApproval: !!m.requiresApproval,
+            photoCriteria: m.photoCriteria || '',
+            photoCriteriaExclude: m.photoCriteriaExclude || '',
             meta: {},
             startedAt: t.levelNumber === startLevel ? new Date() : null,
             updatedAt: new Date(),

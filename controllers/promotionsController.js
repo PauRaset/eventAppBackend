@@ -6,6 +6,12 @@ const UserClubPromotionProgress = require('../models/UserClubPromotionProgress')
 const PromotionClaim = require('../models/PromotionClaim');
 const Notification = require('../models/Notification');
 const { sendPushNotificationToUser } = require('../utils/sendPushNotification');
+const {
+  isPhotoMission,
+  PHOTO_CRITERIA_MIN_LENGTH,
+  PHOTO_CRITERIA_MAX_LENGTH,
+  PHOTO_CRITERIA_EXCLUDE_MAX_LENGTH,
+} = require('../utils/photoMissions');
 
 // Opcionales (si existen en tu backend)
 let UserModel = null;
@@ -281,11 +287,44 @@ function normalizeMissionInput(mission = {}, idx = 0) {
     target,
     unit: String(mission.unit || '').trim(),
     params: mission.params && typeof mission.params === 'object' ? mission.params : {},
+    photoCriteria: String(mission.photoCriteria || '').trim(),
+    photoCriteriaExclude: String(mission.photoCriteriaExclude || '').trim(),
     validationType: String(mission.validationType || (requiresApproval ? 'manual' : 'automatic')).trim() || 'automatic',
     requiresApproval,
     order,
     active,
   };
+}
+
+/**
+ * Las misiones de foto deben llevar photoCriteria con sentido (lo que debe verse
+ * en la foto): sin eso nadie, ni el club ni una IA, tiene criterio para validar.
+ * Devuelve null si todo está bien, o { error, missionKey, levelNumber, ... }.
+ */
+function findInvalidPhotoCriteria(levels) {
+  for (const level of levels) {
+    for (const m of level.missions || []) {
+      if (!isPhotoMission(m)) continue;
+
+      const missionKey = String(
+        m.missionKey || m._id || m.id || `L${level.levelNumber}_${m.type}_${m.order}`
+      );
+      const base = { missionKey, levelNumber: level.levelNumber, type: m.type, title: m.title };
+      const criteria = String(m.photoCriteria || '').trim();
+      const exclude = String(m.photoCriteriaExclude || '').trim();
+
+      if (criteria.length < PHOTO_CRITERIA_MIN_LENGTH) {
+        return { error: 'photo_criteria_required', minLength: PHOTO_CRITERIA_MIN_LENGTH, ...base };
+      }
+      if (criteria.length > PHOTO_CRITERIA_MAX_LENGTH) {
+        return { error: 'photo_criteria_too_long', maxLength: PHOTO_CRITERIA_MAX_LENGTH, ...base };
+      }
+      if (exclude.length > PHOTO_CRITERIA_EXCLUDE_MAX_LENGTH) {
+        return { error: 'photo_criteria_exclude_too_long', maxLength: PHOTO_CRITERIA_EXCLUDE_MAX_LENGTH, ...base };
+      }
+    }
+  }
+  return null;
 }
 
 function normalizeRewardInput(reward = {}) {
@@ -362,6 +401,9 @@ function serializeLevelDoc(doc) {
               target: Number(m?.target || 1),
               unit: m?.unit || '',
               params: m?.params || {},
+              isPhotoMission: isPhotoMission(m),
+              photoCriteria: m?.photoCriteria || '',
+              photoCriteriaExclude: m?.photoCriteriaExclude || '',
               validationType: m?.validationType || (m?.requiresApproval ? 'manual' : 'automatic'),
               requiresApproval: !!m?.requiresApproval,
               order: Number(m?.order || 0),
@@ -480,6 +522,8 @@ function syncMissionWithTemplate(existingMission, templateMission, missionIndex 
     target: Number(templateMission.target || 1),
     unit: String(templateMission.unit || ''),
     params: templateMission.params && typeof templateMission.params === 'object' ? templateMission.params : {},
+    photoCriteria: String(templateMission.photoCriteria || ''),
+    photoCriteriaExclude: String(templateMission.photoCriteriaExclude || ''),
     validationType:
       String(
         templateMission.validationType ||
@@ -754,17 +798,6 @@ function syncCounterBasedMissions(progress, userDoc = null) {
   return changed;
 }
 
-function isPhotoMissionType(type) {
-  const normalized = String(type || '').trim().toLowerCase();
-  if (!normalized) return false;
-
-  return (
-    normalized === 'approved_event_photo' ||
-    normalized.includes('photo') ||
-    normalized.includes('foto')
-  );
-}
-
 function updatePhotoMissionsForLevel(
   level,
   {
@@ -799,7 +832,7 @@ function updatePhotoMissionsForLevel(
     } else if (wantedTitle) {
       matchesMission = currentTitle === wantedTitle;
     } else {
-      matchesMission = isPhotoMissionType(currentType);
+      matchesMission = isPhotoMission(currentType);
     }
 
     if (!matchesMission) {
@@ -1644,16 +1677,22 @@ exports.upsertClubLevelOverrides = async (req, res) => {
       return res.status(400).json({ ok: false, error: 'Missing levels array' });
     }
 
-    await ensureClubTemplates(clubId);
-
-    // Reemplazo completo de la configuración del club para simplificar la primera versión.
-    await PromotionLevelTemplate.deleteMany({ scope: 'club', club: clubId });
-
     const docsToInsert = payloadLevels.map((level, idx) => ({
       scope: 'club',
       club: clubId,
       ...normalizeLevelInput(level, idx),
     }));
+
+    // Validar ANTES de borrar nada: si falla, la configuración actual queda intacta.
+    const invalid = findInvalidPhotoCriteria(docsToInsert);
+    if (invalid) {
+      return res.status(400).json({ ok: false, ...invalid });
+    }
+
+    await ensureClubTemplates(clubId);
+
+    // Reemplazo completo de la configuración del club para simplificar la primera versión.
+    await PromotionLevelTemplate.deleteMany({ scope: 'club', club: clubId });
 
     if (docsToInsert.length) {
       await PromotionLevelTemplate.insertMany(docsToInsert, { ordered: true });

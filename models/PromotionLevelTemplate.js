@@ -1,5 +1,10 @@
 // models/PromotionLevelTemplate.js
 const mongoose = require('mongoose');
+const {
+  isPhotoMission,
+  DEFAULT_PHOTO_CRITERIA,
+  DEFAULT_PHOTO_CRITERIA_EXCLUDE,
+} = require('../utils/photoMissions');
 
 const { Schema } = mongoose;
 
@@ -65,6 +70,15 @@ const MissionSchema = new Schema({
 
   // Parámetros extra según misión
   params: { type: Schema.Types.Mixed, default: {} },
+
+  // Qué debe verse en la foto para dar la misión por cumplida.
+  // Lo escribe el club. Obligatorio en misiones de foto (se exige al guardar
+  // niveles en PUT /api/promotions/clubs/:clubId/levels, no aquí, para no
+  // romper documentos antiguos antes de la migración).
+  photoCriteria: { type: String, default: '', maxlength: 300 },
+
+  // Opcional: qué NO vale, para casos que el club quiera excluir.
+  photoCriteriaExclude: { type: String, default: '', maxlength: 200 },
 
   // Tipo de validación para que la app/backend sepan cómo contar la misión
   validationType: {
@@ -215,7 +229,7 @@ PromotionLevelTemplateSchema.pre('save', function (next) {
  * Lo dejo aquí para que luego podamos “seedear” fácil desde un script o al arrancar.
  */
 PromotionLevelTemplateSchema.statics.getDefaultTemplates = function () {
-  return [
+  return withDefaultPhotoCriteria([
     {
       scope: 'global',
       levelNumber: 1,
@@ -465,7 +479,23 @@ PromotionLevelTemplateSchema.statics.getDefaultTemplates = function () {
       ],
       reward: { type: 'trip', title: 'Viaje a Nueva York (1 semana)', value: 1, meta: { destination: 'New York', durationDays: 7 } },
     },
-  ];
+  ]);
 };
+
+/** Las misiones de foto de las plantillas por defecto llevan el criterio por defecto de su tipo. */
+function withDefaultPhotoCriteria(templates) {
+  return templates.map((level) => ({
+    ...level,
+    missions: (level.missions || []).map((m) =>
+      isPhotoMission(m) && !m.photoCriteria
+        ? {
+            ...m,
+            photoCriteria: DEFAULT_PHOTO_CRITERIA[m.type] || '',
+            photoCriteriaExclude: m.photoCriteriaExclude || DEFAULT_PHOTO_CRITERIA_EXCLUDE,
+          }
+        : m
+    ),
+  }));
+}
 
 module.exports = mongoose.model('PromotionLevelTemplate', PromotionLevelTemplateSchema);

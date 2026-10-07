@@ -15,6 +15,7 @@ const Order = require("../models/Order"); // entradas: compra pagada = Order.sta
 const Ticket = require("../models/Ticket");
 const Club = require("../models/Club");
 const QrScan = require("../models/QrScan");
+const { isPhotoMission } = require("../utils/photoMissions");
 const { makeToken } = require("../utils/ticketToken");
 const User = require("../models/User");
 const Notification = require("../models/Notification");
@@ -637,7 +638,7 @@ function updatePhotoMissionsForLevel(level, eventId, missionKey) {
 
   for (const m of level.missions || []) {
     if (String(m.missionKey || "") !== String(missionKey)) continue;
-    if (!isPhotoMissionType(m.type, m)) continue;
+    if (!isPhotoMission(m)) continue;
     matched = true;
 
     const perEvent = !!(m.params && m.params.perEvent) || !!(m.meta && m.meta.perEvent);
@@ -689,44 +690,8 @@ async function ensurePromotionProgressDoc({ userId, clubId }) {
   return progress;
 }
 
-function isPhotoMissionType(type, mission = null) {
-  const normalized = (type || "").toString().trim().toLowerCase();
-
-  const exactTypes = new Set([
-    "upload_event_photo",
-    "event_photo",
-    "upload_photo",
-    "photo_upload",
-    "upload-photo",
-    "event-photo",
-    "group_photo",
-    "photo_group",
-    "group-event-photo",
-    "selfie_photo",
-    "photo_selfie",
-  ]);
-
-  if (exactTypes.has(normalized)) return true;
-
-  if (
-    normalized.includes("photo") ||
-    normalized.includes("foto") ||
-    normalized.includes("selfie")
-  ) {
-    return true;
-  }
-
-  const title = (mission?.title || "").toString().trim().toLowerCase();
-  if (
-    title.includes("foto") ||
-    title.includes("photo") ||
-    title.includes("selfie")
-  ) {
-    return true;
-  }
-
-  return false;
-}
+// Qué es "misión de foto" lo decide utils/photoMissions.js (isPhotoMission),
+// por LISTA DE TIPOS. Antes se buscaba 'photo'/'foto'/'selfie' en el tipo o el título.
 
 function isActivePhotoMissionStatus(status) {
   const normalized = (status || "").toString().trim().toLowerCase();
@@ -762,7 +727,7 @@ async function resolveActivePhotoMissionForUser({ userId, event }) {
   const missions = Array.isArray(currentLevel.missions) ? currentLevel.missions : [];
   const mission = missions.find((m) => {
     if (!m) return false;
-    return isPhotoMissionType(m.type, m) && isActivePhotoMissionStatus(m.status);
+    return isPhotoMission(m) && isActivePhotoMissionStatus(m.status);
   });
 
   if (!mission) return null;
@@ -810,7 +775,7 @@ async function resolvePhotoMissionForUpload({ userId, event, missionKey }) {
 
   const mission = (level.missions || []).find((m) => m && String(m.missionKey || "") === String(missionKey));
   if (!mission) return null;
-  if (!isPhotoMissionType(mission.type, mission)) return null;
+  if (!isPhotoMission(mission)) return null;
   if (String(mission.status || "") === "completed") return null;
 
   return {
