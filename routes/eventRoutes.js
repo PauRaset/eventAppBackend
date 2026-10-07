@@ -14,6 +14,7 @@ const Event = require("../models/Event");
 const Order = require("../models/Order"); // entradas: compra pagada = Order.status 'paid'
 const Ticket = require("../models/Ticket");
 const Club = require("../models/Club");
+const QrScan = require("../models/QrScan");
 const { makeToken } = require("../utils/ticketToken");
 const User = require("../models/User");
 const Notification = require("../models/Notification");
@@ -624,36 +625,19 @@ function updateAttendMissionsForLevel(level, counters) {
   }
 }
 
-function updatePhotoMissionsForLevel(level, eventId, counters, missionMatch = null) {
+/**
+ * Aplica UNA foto aprobada a UNA misión concreta, identificada por su missionKey.
+ * ⚠️ Sin missionKey no se toca nada: una foto sin misión es una foto del muro.
+ * (Antes, sin datos de misión, contaba para TODAS las misiones de foto de todos
+ * los niveles, y también se emparejaba por tipo o título.)
+ */
+function updatePhotoMissionsForLevel(level, eventId, missionKey) {
+  if (!missionKey) return false;
   let matched = false;
 
   for (const m of level.missions || []) {
+    if (String(m.missionKey || "") !== String(missionKey)) continue;
     if (!isPhotoMissionType(m.type, m)) continue;
-
-    const missionKeyMatches =
-      missionMatch?.missionKey &&
-      String(m.missionKey || "") === String(missionMatch.missionKey);
-
-    const missionTypeMatches =
-      missionMatch?.missionType &&
-      String(m.type || "") === String(missionMatch.missionType);
-
-    const missionTitleMatches =
-      missionMatch?.missionTitle &&
-      String(m.title || "").trim().toLowerCase() ===
-        String(missionMatch.missionTitle || "").trim().toLowerCase();
-
-    const noSpecificMissionRequested =
-      !missionMatch ||
-      (!missionMatch.missionKey && !missionMatch.missionType && !missionMatch.missionTitle);
-
-    const sameMission =
-      noSpecificMissionRequested ||
-      missionKeyMatches ||
-      missionTypeMatches ||
-      missionTitleMatches;
-
-    if (!sameMission) continue;
     matched = true;
 
     const perEvent = !!(m.params && m.params.perEvent) || !!(m.meta && m.meta.perEvent);
@@ -666,8 +650,9 @@ function updatePhotoMissionsForLevel(level, eventId, counters, missionMatch = nu
       m.meta = { ...(m.meta || {}), eventIds: updated, perEvent: true };
       m.current = Math.min(updated.length, Number(m.target || 1));
     } else {
-      const count = Number(counters.photosUploadedInClub || 0);
-      m.current = Math.min(count, Number(m.target || 1));
+      // Cada foto aprobada PARA ESTA misión suma 1 (antes usaba el contador global
+      // del club, que mezclaba fotos de cualquier misión y del muro).
+      m.current = Math.min(Number(m.current || 0) + 1, Number(m.target || 1));
     }
 
     if (level.status === "locked") continue;
@@ -795,6 +780,170 @@ async function resolveActivePhotoMissionForUser({ userId, event }) {
   };
 }
 
+/**
+ * Clave de "club" con la que se guarda el progreso de promociones de un evento.
+ * Mismo criterio que resolveActivePhotoMissionForUser (createdBy primero), para
+ * que validar, escanear y aprobar miren el MISMO documento de progreso.
+ */
+function promotionClubKeyForEvent(event) {
+  const raw = event?.createdBy || event?.clubId || event?.club || null;
+  if (!raw) return null;
+  return String(raw._id || raw);
+}
+
+/**
+ * EL SERVIDOR DECIDE LA MISIÓN: valida el missionKey que manda la app contra el
+ * progreso real del usuario en el club del evento. Debe existir, ser del nivel
+ * actual, ser de foto y no estar completada. Devuelve los datos de la misión
+ * sacados del PROGRESO (no del cuerpo de la petición), o null si no es válida.
+ */
+async function resolvePhotoMissionForUpload({ userId, event, missionKey }) {
+  const clubId = promotionClubKeyForEvent(event);
+  if (!userId || !clubId || !missionKey) return null;
+
+  const progress = await UserClubPromotionProgress.findOne({ user: userId, club: clubId }).lean();
+  if (!progress) return null;
+
+  const currentLevelNumber = Number(progress.currentLevel || 1);
+  const level = (progress.levels || []).find((l) => Number(l?.levelNumber) === currentLevelNumber);
+  if (!level || level.status === "locked") return null;
+
+  const mission = (level.missions || []).find((m) => m && String(m.missionKey || "") === String(missionKey));
+  if (!mission) return null;
+  if (!isPhotoMissionType(mission.type, mission)) return null;
+  if (String(mission.status || "") === "completed") return null;
+
+  return {
+    missionType: mission.type || null,
+    missionId: mission.missionKey,
+    missionTitle: mission.title || null,
+    missionTarget: Number(mission.target || 1),
+    missionCurrent: Number(mission.current || 0),
+    levelNumber: Number(level.levelNumber),
+  };
+}
+
+// Una foto de misión exige haber escaneado el QR del evento en este margen.
+const QR_SCAN_WINDOW_MS = 4 * 60 * 60 * 1000;
+
+async function hasRecentQrScan(userId, eventId) {
+  if (!mongoose.isValidObjectId(String(userId || "")) || !mongoose.isValidObjectId(String(eventId || ""))) {
+    return false;
+  }
+  const since = new Date(Date.now() - QR_SCAN_WINDOW_MS);
+  const scan = await QrScan.findOne({ user: userId, event: eventId, scannedAt: { $gte: since } })
+    .select("_id")
+    .lean();
+  return !!scan;
+}
+
+/** Registra un escaneo (prueba de presencia). Devuelve { firstScan } (primer escaneo de ese evento). */
+async function recordQrScan(req, event) {
+  const userId = req.user?.id;
+  if (!mongoose.isValidObjectId(String(userId || ""))) return { firstScan: false };
+
+  const previous = await QrScan.findOne({ user: userId, event: event._id }).select("_id").lean();
+  await QrScan.create({
+    user: userId,
+    event: event._id,
+    scannedAt: new Date(),
+    ip: (req.ip || "").toString(),
+    userAgent: (req.headers["user-agent"] || "").toString().slice(0, 300),
+  });
+  return { firstScan: !previous };
+}
+
+/**
+ * Un escaneo (de un evento nuevo) suma 1 a las misiones scan_qr de los niveles
+ * YA desbloqueados. Los niveles bloqueados no acumulan: el reto "encuentra el
+ * QR" de un nivel se cumple estando en ese nivel, no con escaneos anteriores.
+ */
+function updateScanQrMissionsForLevel(level) {
+  if (level.status === "locked") return;
+
+  for (const m of level.missions || []) {
+    if (m.type !== "scan_qr") continue;
+    if (m.status === "completed") continue;
+
+    m.current = Math.min(Number(m.current || 0) + 1, Number(m.target || 1));
+
+    if (m.current >= Number(m.target || 1)) {
+      m.status = "completed";
+      m.completedAt = m.completedAt || new Date();
+    } else if (m.status !== "pending") {
+      m.status = "in_progress";
+    }
+    m.updatedAt = new Date();
+  }
+}
+
+/**
+ * Misiones scan_qr: cuenta EVENTOS distintos escaneados en el club (solo se llama
+ * en el primer escaneo de cada evento), para que reescanear el mismo QR no infle
+ * el contador. Mismo patrón que syncPromotionAfterAttend.
+ */
+async function syncPromotionAfterQrScan({ userId, clubId, eventId }) {
+  try {
+    const progress = await ensurePromotionProgressDoc({ userId, clubId });
+    if (!progress) return;
+
+    progress.counters = progress.counters || {};
+    progress.counters.qrScansInClub = clampNonNegative((progress.counters.qrScansInClub || 0) + 1);
+
+    for (const lvl of progress.levels || []) {
+      updateScanQrMissionsForLevel(lvl);
+      lvl.progress = computeLevelProgress(lvl);
+    }
+
+    let guard = 0;
+    while (guard++ < 15) {
+      const cur = (progress.levels || []).find((l) => Number(l.levelNumber) === Number(progress.currentLevel));
+      if (!cur) break;
+
+      cur.progress = computeLevelProgress(cur);
+      if (cur.status !== "completed" && allMissionsCompleted(cur)) {
+        cur.status = "completed";
+        cur.completedAt = new Date();
+        unlockNextLevel(progress, cur.levelNumber);
+        continue;
+      }
+      break;
+    }
+
+    refreshCurrentSnapshot(progress);
+    progress.lastEventId = eventId || progress.lastEventId;
+    progress.lastActivityAt = new Date();
+    await progress.save();
+  } catch (e) {
+    console.warn("[promotions] syncPromotionAfterQrScan failed:", e?.message || e);
+  }
+}
+
+/**
+ * ¿Puede este usuario gestionar el evento? Dueño (createdBy) o dueño/manager
+ * del Club vinculado. Solo por ids (_id de Mongo / uid de Firebase), NUNCA por
+ * email: User.email se puede cambiar sin verificar.
+ */
+async function canManageEvent(req, event) {
+  const ids = new Set([req.user?.id, req.firebaseUser?.uid].filter(Boolean).map(String));
+  if (!ids.size) return false;
+
+  const createdBy = event?.createdBy ? String(event.createdBy._id || event.createdBy) : "";
+  if (createdBy && ids.has(createdBy)) return true;
+
+  const clubRef = event?.club || (/^[a-fA-F0-9]{24}$/.test(String(event?.clubId || "")) ? event.clubId : null);
+  if (!clubRef) return false;
+
+  const club = await Club.findById(clubRef).select("ownerUserId managers").lean();
+  if (!club) return false;
+
+  if (mongoose.isValidObjectId(String(req.user?.id || ""))) {
+    const me = await User.findById(req.user.id).select("firebaseUid").lean();
+    if (me?.firebaseUid) ids.add(String(me.firebaseUid));
+  }
+  return [club.ownerUserId, ...(club.managers || [])].filter(Boolean).some((p) => ids.has(String(p)));
+}
+
 async function syncPromotionAfterAttend({ userId, clubId, eventId, attendedNow }) {
   try {
     const progress = await ensurePromotionProgressDoc({ userId, clubId });
@@ -835,6 +984,12 @@ async function syncPromotionAfterAttend({ userId, clubId, eventId, attendedNow }
   }
 }
 
+/**
+ * Una foto APROBADA avanza SOLO la misión cuyo missionKey lleva. Sin missionKey
+ * no hace nada (foto del muro). Sin emparejar por tipo/título ni "la primera
+ * misión de foto activa": eso permitía que una foto contara para misiones que
+ * el usuario no eligió.
+ */
 async function syncPromotionAfterPhotoApproved({
   userId,
   clubId,
@@ -845,6 +1000,8 @@ async function syncPromotionAfterPhotoApproved({
   levelNumber = null,
 }) {
   try {
+    if (!missionKey) return;
+
     const progress = await ensurePromotionProgressDoc({ userId, clubId });
     if (!progress) return;
 
@@ -858,50 +1015,10 @@ async function syncPromotionAfterPhotoApproved({
 
     for (const lvl of levels) {
       const sameLevel = numericLevelNumber == null || Number(lvl.levelNumber) === numericLevelNumber;
-      if (!sameLevel) {
-        lvl.progress = computeLevelProgress(lvl);
-        continue;
-      }
-
-      const matchedInLevel = updatePhotoMissionsForLevel(
-        lvl,
-        eventId,
-        progress.counters,
-        {
-          missionKey: missionKey || null,
-          missionType: missionType || null,
-          missionTitle: missionTitle || null,
-        }
-      );
-
-      if (matchedInLevel) {
+      if (sameLevel && updatePhotoMissionsForLevel(lvl, eventId, missionKey)) {
         matchedMission = true;
       }
-
       lvl.progress = computeLevelProgress(lvl);
-    }
-
-    if (!matchedMission) {
-      const currentLevel = (progress.levels || []).find(
-        (lvl) => numericLevelNumber == null || Number(lvl.levelNumber) === numericLevelNumber
-      );
-
-      if (currentLevel) {
-        const fallbackMission = (currentLevel.missions || []).find((m) =>
-          isPhotoMissionType(m.type, m) &&
-          ["in_progress", "pending", "rejected"].includes(String(m.status || "").toLowerCase())
-        );
-
-        if (fallbackMission) {
-          updatePhotoMissionsForLevel(currentLevel, eventId, progress.counters, {
-            missionKey: fallbackMission.missionKey || null,
-            missionType: fallbackMission.type || null,
-            missionTitle: fallbackMission.title || null,
-          });
-          currentLevel.progress = computeLevelProgress(currentLevel);
-          matchedMission = true;
-        }
-      }
     }
 
     if (!matchedMission) {
@@ -953,6 +1070,13 @@ const storage = multer.diskStorage({
 const upload = multer({ storage });
 // Para aceptar múltiples campos/arrays con nombres distintos:
 const uploadAny = multer({ storage });
+
+/** Borra los temporales de multer de una subida que se rechaza antes de procesarla. */
+function cleanupUploadedFiles(files) {
+  for (const f of files || []) {
+    try { if (f?.path) fs.unlinkSync(f.path); } catch {}
+  }
+}
 
 /* Proceso de imagen (resize → .jpg) */
 async function processImageToJpg(srcPath, outDir, baseName) {
@@ -1206,6 +1330,9 @@ router.get("/mine", anyAuth, ensureUserId, async (req, res) => {
         { club: userId },
       ],
     })
+      // Eventos del propio club (ruta autenticada): sí incluye el secreto del QR.
+      // Sin "+qrToken" el backfill de abajo regeneraría el token en cada carga.
+      .select("+qrToken")
       .sort({ startAt: -1, date: -1, createdAt: -1 })
       .populate("createdBy", "username email profilePicture displayName");
 
@@ -1475,11 +1602,14 @@ async function attendeesHandler(req, res, forceFull = false) {
    - El QR del evento abre la cámara dentro de la app
    - La app resuelve el token y sube la foto al evento correcto
 ------------------------------------------------------------------- */
-router.post("/scan/resolve", anyAuth, ensureUserId, async (req, res) => {
+/**
+ * Escanear el QR del local = prueba de presencia. Registra el escaneo (QrScan),
+ * hace avanzar las misiones scan_qr (solo en el primer escaneo de cada evento)
+ * y devuelve la misión de foto activa del usuario.
+ */
+async function handleQrScanResolve(req, res, rawPayload, logTag) {
   try {
-    const parsed = parseQrPayloadValue(
-      req.body?.qrPayload || req.body?.payload || req.body?.qr || req.body?.token
-    );
+    const parsed = parseQrPayloadValue(rawPayload);
 
     if (!parsed || !parsed.qrToken) {
       return res.status(400).json({ message: "QR inválido" });
@@ -1490,9 +1620,16 @@ router.post("/scan/resolve", anyAuth, ensureUserId, async (req, res) => {
       query._id = parsed.eventId;
     }
 
-    const event = await Event.findOne(query).lean();
+    // +qrToken: buildQrResolveResponse lo usa para las URLs de subida
+    const event = await Event.findOne(query).select("+qrToken").lean();
     if (!event) {
       return res.status(404).json({ message: "Evento no encontrado para este QR" });
+    }
+
+    const { firstScan } = await recordQrScan(req, event);
+    const clubId = promotionClubKeyForEvent(event);
+    if (firstScan && clubId) {
+      await syncPromotionAfterQrScan({ userId: req.user.id, clubId, eventId: event._id });
     }
 
     const activePhotoMission = await resolveActivePhotoMissionForUser({
@@ -1502,40 +1639,23 @@ router.post("/scan/resolve", anyAuth, ensureUserId, async (req, res) => {
 
     return res.json(buildQrResolveResponse(req, event, activePhotoMission));
   } catch (e) {
-    console.error("[POST /events/scan/resolve] error:", e);
+    console.error(`[${logTag}] error:`, e);
     return res.status(500).json({ message: "Error resolviendo QR" });
   }
-});
+}
 
-router.get("/scan/:token/resolve", anyAuth, ensureUserId, async (req, res) => {
-  try {
-    const parsed = parseQrPayloadValue(req.params.token);
+router.post("/scan/resolve", anyAuth, ensureUserId, (req, res) =>
+  handleQrScanResolve(
+    req,
+    res,
+    req.body?.qrPayload || req.body?.payload || req.body?.qr || req.body?.token,
+    "POST /events/scan/resolve"
+  )
+);
 
-    if (!parsed || !parsed.qrToken) {
-      return res.status(400).json({ message: "QR inválido" });
-    }
-
-    const query = { qrToken: parsed.qrToken };
-    if (parsed.eventId && mongoose.isValidObjectId(parsed.eventId)) {
-      query._id = parsed.eventId;
-    }
-
-    const event = await Event.findOne(query).lean();
-    if (!event) {
-      return res.status(404).json({ message: "Evento no encontrado para este QR" });
-    }
-
-    const activePhotoMission = await resolveActivePhotoMissionForUser({
-      userId: req.user.id,
-      event,
-    });
-
-    return res.json(buildQrResolveResponse(req, event, activePhotoMission));
-  } catch (e) {
-    console.error("[GET /events/scan/:token/resolve] error:", e);
-    return res.status(500).json({ message: "Error resolviendo QR" });
-  }
-});
+router.get("/scan/:token/resolve", anyAuth, ensureUserId, (req, res) =>
+  handleQrScanResolve(req, res, req.params.token, "GET /events/scan/:token/resolve")
+);
 
 router.post("/scan/:token/photo", anyAuth, ensureUserId, uploadAny.any(), async (req, res, next) => {
   try {
@@ -1556,6 +1676,7 @@ router.post("/scan/:token/photo", anyAuth, ensureUserId, uploadAny.any(), async 
     }
 
     req.params.id = String(event._id);
+    req.viaQrScan = true; // la foto queda marcada como subida por el flujo del QR
     return postPhotosHandler(req, res, next);
   } catch (e) {
     console.error("[POST /events/scan/:token/photo] error:", e);
@@ -2541,6 +2662,85 @@ router.get("/:id/attendees/populated", (req, res) => attendeesHandler(req, res, 
 /* ------------------------------------------------------------------
    DETALLE DE EVENTO (público; calcula isOwner si hay usuario)
 ------------------------------------------------------------------- */
+/* ------------------------------------------------------------------
+   QR DEL LOCAL (solo quien gestiona el evento)
+   GET /api/events/:id/qr -> { eventId, qrToken, qrPayload }
+   El qrToken es la prueba de presencia de las misiones: NO sale en ninguna
+   ruta pública (Event.qrToken es select:false). El portal lo pide aquí para
+   pintar el QR del evento.
+------------------------------------------------------------------- */
+router.get("/:id/qr", anyAuth, ensureUserId, async (req, res) => {
+  try {
+    res.set("Cache-Control", "no-store");
+
+    const { id } = req.params;
+    if (!mongoose.isValidObjectId(id)) {
+      return res.status(400).json({ message: "ID de evento inválido" });
+    }
+
+    const event = await Event.findById(id).select("+qrToken createdBy club clubId");
+    if (!event) return res.status(404).json({ message: "Evento no encontrado" });
+
+    if (!(await canManageEvent(req, event))) {
+      return res.status(403).json({ message: "No tienes permiso para ver el QR de este evento" });
+    }
+
+    // Backfill para eventos antiguos sin qrToken (aquí sí está cargado: no regenera uno existente)
+    if (!event.qrToken) {
+      event.qrToken = new mongoose.Types.ObjectId().toString();
+      await event.save();
+    }
+
+    return res.json({
+      eventId: String(event._id),
+      qrToken: event.qrToken,
+      qrPayload: `NV_EVENT:${event._id}:${event.qrToken}`,
+    });
+  } catch (e) {
+    console.error("[GET /events/:id/qr] error:", e);
+    return res.status(500).json({ message: "Error obteniendo el QR del evento" });
+  }
+});
+
+/* ------------------------------------------------------------------
+   ROTAR EL QR DEL LOCAL (solo quien gestiona el evento)
+   POST /api/events/:id/qr/rotate -> { eventId, qrToken, qrPayload }
+   Genera un qrToken nuevo: el QR anterior (impreso o filtrado) deja de valer
+   al instante. Hay que volver a imprimir el QR. Los escaneos ya registrados
+   (QrScan) siguen contando durante su ventana de 4 h.
+------------------------------------------------------------------- */
+router.post("/:id/qr/rotate", anyAuth, ensureUserId, async (req, res) => {
+  try {
+    res.set("Cache-Control", "no-store");
+
+    const { id } = req.params;
+    if (!mongoose.isValidObjectId(id)) {
+      return res.status(400).json({ message: "ID de evento inválido" });
+    }
+
+    const event = await Event.findById(id).select("+qrToken createdBy club clubId");
+    if (!event) return res.status(404).json({ message: "Evento no encontrado" });
+
+    if (!(await canManageEvent(req, event))) {
+      return res.status(403).json({ message: "No tienes permiso para cambiar el QR de este evento" });
+    }
+
+    event.qrToken = crypto.randomBytes(16).toString("hex");
+    await event.save();
+
+    console.log("[qr] qrToken rotado", { eventId: String(event._id), by: req.user?.id || null });
+
+    return res.json({
+      eventId: String(event._id),
+      qrToken: event.qrToken,
+      qrPayload: `NV_EVENT:${event._id}:${event.qrToken}`,
+    });
+  } catch (e) {
+    console.error("[POST /events/:id/qr/rotate] error:", e);
+    return res.status(500).json({ message: "Error cambiando el QR del evento" });
+  }
+});
+
 router.get("/:id", optionalUserId, async (req, res) => {
   try {
     const event = await Event.findById(req.params.id).populate(
@@ -2549,13 +2749,10 @@ router.get("/:id", optionalUserId, async (req, res) => {
     );
     if (!event) return res.status(404).json({ message: "Evento no encontrado" });
 
-    // Backfill de qrToken para eventos antiguos que se crearon antes de añadir este campo.
-    if (!event.qrToken) {
-      event.qrToken = new mongoose.Types.ObjectId().toString();
-      await event.save();
-    }
-
+    // ⚠️ Ruta PÚBLICA: sin qrToken ni qrPayload (secreto del QR del local).
+    // El portal lo obtiene en GET /api/events/:id/qr (solo quien gestiona el evento).
     const obj = event.toObject();
+    delete obj.qrToken;
 
     const formattedEvent = {
       ...obj,
@@ -2570,7 +2767,6 @@ router.get("/:id", optionalUserId, async (req, res) => {
       categories: Array.isArray(obj.categories)
         ? obj.categories
         : parseCategoriesMaybe(obj.categories),
-      qrPayload: `NV_EVENT:${obj._id}:${obj.qrToken || ""}`,
     };
 
     const userId = req.user ? req.user.id : null; // si algún middleware previo lo puso
@@ -2919,6 +3115,7 @@ router.get("/:id/photos/moderation", anyAuth, ensureUserId, async (req, res) => 
       missionCurrent: p.missionCurrent ?? null,
       missionTarget: p.missionTarget ?? null,
       levelNumber: p.levelNumber ?? null,
+      viaQrScan: !!p.viaQrScan,
       validatedForMissionType: p.validatedForMissionType || null,
       validatedForMissionId: p.validatedForMissionId || null,
       validatedForMissionTitle: p.validatedForMissionTitle || null,
@@ -2953,6 +3150,8 @@ router.post("/:id/photos/:photoId/approve", anyAuth, ensureUserId, async (req, r
 
     const note = (req.body?.reviewNote || "").toString();
     const validationMeta = extractPhotoValidationMeta(req.body || {});
+    // Re-aprobar una foto ya aprobada no debe volver a sumar a la misión
+    const wasApproved = event.photos[idx].status === "approved";
 
     event.photos[idx].status = "approved";
     event.photos[idx].reviewedBy = req.user.id;
@@ -2975,10 +3174,11 @@ router.post("/:id/photos/:photoId/approve", anyAuth, ensureUserId, async (req, r
       photo: approvedPhoto,
     });
 
-    // Promotions: solo cuenta cuando está aprobada
+    // Promotions: solo cuenta cuando está aprobada, una sola vez, y SOLO para la
+    // misión que lleva la foto (sin missionId = foto del muro: no avanza nada).
     const clubId = event.createdBy ? event.createdBy.toString() : null;
     const uploaderId = approvedPhoto.by ? approvedPhoto.by.toString() : null;
-    if (clubId && uploaderId) {
+    if (clubId && uploaderId && !wasApproved) {
       await syncPromotionAfterPhotoApproved({
         userId: uploaderId,
         clubId,
@@ -3184,7 +3384,46 @@ async function postPhotosHandler(req, res) {
       return res.status(400).json({ message: "No se recibieron archivos" });
     }
 
-    const missionMeta = extractPhotoMissionMeta(req.body || {});
+    // ---- Misión: la decide el SERVIDOR, no el cliente ----
+    // Del cuerpo solo se toma el missionId (= missionKey). Tipo, título, objetivo
+    // y nivel salen del progreso real. Sin missionId: foto del muro, sin misión.
+    const requestedMissionId = extractPhotoMissionMeta(req.body || {}).missionId;
+    let missionMeta = {
+      missionType: null,
+      missionId: null,
+      missionTitle: null,
+      missionDescription: null,
+      missionCurrent: null,
+      missionTarget: null,
+      levelNumber: null,
+    };
+
+    if (requestedMissionId) {
+      const resolved = await resolvePhotoMissionForUpload({
+        userId: req.user.id,
+        event,
+        missionKey: requestedMissionId,
+      });
+      if (!resolved) {
+        cleanupUploadedFiles(files);
+        return res.status(400).json({
+          error: "invalid_mission",
+          message: "Esa misión no existe, no es de tu nivel actual, no es de foto o ya está completada",
+        });
+      }
+
+      // Presencia: escaneo del QR de ESTE evento en las últimas 4 h
+      if (!(await hasRecentQrScan(req.user.id, event._id))) {
+        cleanupUploadedFiles(files);
+        return res.status(403).json({
+          error: "scan_required",
+          message: "Escanea el QR del local para subir fotos de misión",
+        });
+      }
+
+      missionMeta = { ...missionMeta, ...resolved };
+    }
+
     // Datos del usuario que sube
     let byUsername = "usuario";
     try {
@@ -3224,6 +3463,7 @@ async function postPhotosHandler(req, res) {
         missionDescription: missionMeta.missionDescription,
         missionCurrent: missionMeta.missionCurrent,
         missionTarget: missionMeta.missionTarget,
+        viaQrScan: req.viaQrScan === true,
         validatedForMissionType: null,
         validatedForMissionId: null,
         validatedForMissionTitle: null,
@@ -3251,6 +3491,7 @@ async function postPhotosHandler(req, res) {
       missionId: m.missionId || null,
       missionTitle: m.missionTitle || null,
       levelNumber: m.levelNumber ?? null,
+      viaQrScan: !!m.viaQrScan,
       validatedForMissionType: m.validatedForMissionType || null,
       validatedForMissionId: m.validatedForMissionId || null,
       validatedForMissionTitle: m.validatedForMissionTitle || null,

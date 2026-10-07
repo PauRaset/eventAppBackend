@@ -35,6 +35,9 @@ const eventPhotoSchema = new mongoose.Schema(
     missionTarget: { type: Number, default: null },
     levelNumber: { type: Number, default: null },
 
+    // true si se subió por el flujo del QR del local (POST /scan/:token/photo)
+    viaQrScan: { type: Boolean, default: false },
+
     // moderation result metadata saved by the club when approving/rejecting the photo
     validatedForMissionType: { type: String, default: null },
     validatedForMissionId: { type: String, default: null },
@@ -219,7 +222,10 @@ const eventSchema = new mongoose.Schema(
 
     // Token único del QR del evento. Servirá como base para generar/validar el QR
     // sin depender de guardar necesariamente la imagen final en la base de datos.
-    qrToken: { type: String, index: true, default: "" },
+    // Secreto del QR del local: prueba de presencia. select:false -> NO sale en
+    // ninguna consulta salvo que se pida explícitamente con .select("+qrToken")
+    // (solo rutas del dueño y la resolución del escaneo).
+    qrToken: { type: String, index: true, default: "", select: false },
 
     // Texto corto opcional del evento, útil si más adelante se presenta también
     // con formato tipo publicación/red social.
@@ -390,7 +396,10 @@ eventSchema.pre("save", function (next) {
 
   // Generar qrToken automáticamente si el evento aún no tiene uno.
   // Así cada evento puede disponer de un identificador único estable para QR.
-  if (!this.qrToken) {
+  // ⚠️ qrToken es select:false: si el documento se cargó sin él, `this.qrToken`
+  // está vacío aunque exista en la BD. Solo generamos si es nuevo o si se cargó
+  // el campo; si no, regeneraríamos (y romperíamos) el QR en cada save().
+  if ((this.isNew || this.isSelected("qrToken")) && !this.qrToken) {
     this.qrToken = new mongoose.Types.ObjectId().toString();
   }
 

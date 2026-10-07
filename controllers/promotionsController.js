@@ -101,21 +101,44 @@ async function getAuthUser(req) {
 }
 
 /**
- * Permisos club/admin para validar claims.
- * Ajusta según tu esquema real de roles.
+ * ¿Puede quien hace la petición gestionar ESTE club (niveles, claims)?
+ *  - clubId es su propio id (_id de Mongo o uid de Firebase): el portal usa el
+ *    _id del usuario-club como clubId, y el progreso también (event.createdBy).
+ *  - o existe un Club con ese _id cuyo ownerUserId / managers incluyen su id.
+ * Sin acceso por rol: antes cualquier usuario con role 'club' gestionaba
+ * CUALQUIER club. Solo identidades verificadas por el middleware de auth
+ * (req.user.id, req.firebaseUser.uid); nunca cabeceras ni email.
  */
-function canManageClub(req, clubId) {
-  const u = req.user || {};
-  const role = (u.role || u.type || u.userType || '').toString().toLowerCase();
+async function canManageClub(req, clubId) {
+  const target = String(clubId || '').trim();
+  if (!target) return false;
 
-  if (role === 'admin') return true;
-  if (role === 'club') return true;
+  const ids = new Set(
+    [req.user?.id, req.userId, req.firebaseUser?.uid].filter(Boolean).map(String)
+  );
+  if (!ids.size) return false;
 
-  // Algunos backends usan el propio userId como clubId
-  if (u._id && clubId && u._id.toString() === clubId.toString()) return true;
+  // Completar la identidad: _id de Mongo <-> uid de Firebase del mismo usuario
+  if (UserModel) {
+    const or = [];
+    const mongoIds = [...ids].filter((v) => isValidObjectId(v));
+    if (mongoIds.length) or.push({ _id: { $in: mongoIds } });
+    or.push({ firebaseUid: { $in: [...ids] } });
+    const me = await UserModel.findOne({ $or: or }).select('_id firebaseUid').lean();
+    if (me?._id) ids.add(String(me._id));
+    if (me?.firebaseUid) ids.add(String(me.firebaseUid));
+  }
 
-  // Si tienes clubId en user
-  if (u.clubId && clubId && u.clubId.toString() === clubId.toString()) return true;
+  if (ids.has(target)) return true;
+
+  if (ClubModel && isValidObjectId(target)) {
+    const club = await ClubModel.findById(target).select('ownerUserId managers').lean();
+    if (club) {
+      return [club.ownerUserId, ...(club.managers || [])]
+        .filter(Boolean)
+        .some((p) => ids.has(String(p)));
+    }
+  }
 
   return false;
 }
@@ -1271,7 +1294,7 @@ exports.listClubClaims = async (req, res) => {
       return res.status(400).json({ ok: false, error: 'Invalid clubId' });
     }
 
-    if (!canManageClub(req, clubId)) {
+    if (!(await canManageClub(req, clubId))) {
       return res.status(403).json({ ok: false, error: 'Forbidden' });
     }
 
@@ -1301,7 +1324,7 @@ exports.approveClaim = async (req, res) => {
     const claim = await PromotionClaim.findById(claimId);
     if (!claim) return res.status(404).json({ ok: false, error: 'Claim not found' });
 
-    if (!canManageClub(req, claim.club.toString())) {
+    if (!(await canManageClub(req, claim.club.toString()))) {
       return res.status(403).json({ ok: false, error: 'Forbidden' });
     }
 
@@ -1410,7 +1433,7 @@ exports.rejectClaim = async (req, res) => {
     const claim = await PromotionClaim.findById(claimId);
     if (!claim) return res.status(404).json({ ok: false, error: 'Claim not found' });
 
-    if (!canManageClub(req, claim.club.toString())) {
+    if (!(await canManageClub(req, claim.club.toString()))) {
       return res.status(403).json({ ok: false, error: 'Forbidden' });
     }
 
@@ -1588,7 +1611,7 @@ exports.getClubPromotionConfig = async (req, res) => {
       return res.status(400).json({ ok: false, error: 'Invalid clubId' });
     }
 
-    if (!canManageClub(req, clubId)) {
+    if (!(await canManageClub(req, clubId))) {
       return res.status(403).json({ ok: false, error: 'Forbidden' });
     }
 
@@ -1612,7 +1635,7 @@ exports.upsertClubLevelOverrides = async (req, res) => {
       return res.status(400).json({ ok: false, error: 'Invalid clubId' });
     }
 
-    if (!canManageClub(req, clubId)) {
+    if (!(await canManageClub(req, clubId))) {
       return res.status(403).json({ ok: false, error: 'Forbidden' });
     }
 
