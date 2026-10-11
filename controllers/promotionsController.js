@@ -280,7 +280,9 @@ function normalizeMissionInput(mission = {}, idx = 0) {
       : String(mission.validationType || '').trim() === 'manual';
 
   return {
-    ...(mission._id ? { _id: mission._id } : {}),
+    // Solo un ObjectId real (24 hex). Ids del portal tipo "mission-1712345678"
+    // hacían fallar insertMany con CastError DESPUÉS de borrar los niveles.
+    ...(/^[a-fA-F0-9]{24}$/.test(String(mission._id || '')) ? { _id: mission._id } : {}),
     type,
     title,
     description,
@@ -415,6 +417,84 @@ function serializeLevelDoc(doc) {
   };
 }
 
+// ¿Admite el MongoDB transacciones (réplica o mongos)? Se averigua en el primer
+// intento y se recuerda: null = sin probar, true / false = ya sabido.
+let transactionsSupported = null;
+
+function isTransactionUnsupportedError(e) {
+  const msg = String(e?.message || '');
+  return (
+    e?.code === 20 ||
+    e?.codeName === 'IllegalOperation' ||
+    /Transaction numbers are only allowed on a replica set member or mongos/i.test(msg) ||
+    /does not support (retryable writes|transactions)/i.test(msg)
+  );
+}
+
+/**
+ * Ejecuta `work(session)` dentro de una transacción si el MongoDB la admite.
+ *  - true:  hecho en transacción (si `work` falla, Mongo deshace todo y se lanza el error).
+ *  - false: el servidor no admite transacciones (standalone); NO se ha escrito
+ *           nada y el llamador debe usar su alternativa sin transacción.
+ */
+async function runInTransactionIfSupported(work) {
+  if (transactionsSupported === false) return false;
+
+  const session = await mongoose.startSession();
+  try {
+    await session.withTransaction(() => work(session));
+    transactionsSupported = true;
+    return true;
+  } catch (e) {
+    if (!isTransactionUnsupportedError(e)) throw e; // la transacción ya se deshizo sola
+    transactionsSupported = false;
+    console.warn(
+      '[promotions] MongoDB sin soporte de transacciones (no es réplica): ' +
+        'escrituras de plantillas con limpieza/restauración ante fallos.'
+    );
+    return false;
+  } finally {
+    session.endSession();
+  }
+}
+
+function isDuplicateKeyError(e) {
+  return e?.code === 11000 || /E11000 duplicate key/i.test(String(e?.message || ''));
+}
+
+/**
+ * Crea las plantillas iniciales del club SIN dejarlo a medias: o se crean todas,
+ * o ninguna. Si se quedara a medias, el club tendría niveles incompletos para
+ * siempre (ensureClubTemplates solo crea plantillas si no hay ninguna).
+ *  1) Con transacción: todo o nada.
+ *  2) Sin transacciones: si insertMany falla, se borran las que ESTA llamada
+ *     insertó (por _id asignado de antemano), sin tocar las de nadie más.
+ */
+async function insertInitialClubTemplates(clubId, docs) {
+  if (!docs.length) return;
+  // _id asignados aquí: así sabemos exactamente qué insertó esta llamada
+  const withIds = docs.map((d) => ({ ...d, _id: new mongoose.Types.ObjectId() }));
+
+  const doneInTransaction = await runInTransactionIfSupported((session) =>
+    PromotionLevelTemplate.insertMany(withIds, { session, ordered: true })
+  );
+  if (doneInTransaction) return;
+
+  try {
+    await PromotionLevelTemplate.insertMany(withIds, { ordered: true });
+  } catch (insertErr) {
+    try {
+      await PromotionLevelTemplate.deleteMany({ _id: { $in: withIds.map((d) => d._id) } });
+    } catch (cleanupErr) {
+      console.error(
+        '🚨 [promotions] Plantillas del club a medias y NO se pudieron limpiar. Revisar a mano:',
+        { clubId: String(clubId), error: cleanupErr?.message || cleanupErr }
+      );
+    }
+    throw insertErr;
+  }
+}
+
 async function ensureClubTemplates(clubId) {
   let clubTemplates = await PromotionLevelTemplate.find({ scope: 'club', club: clubId })
     .sort({ order: 1, levelNumber: 1 })
@@ -439,8 +519,12 @@ async function ensureClubTemplates(clubId) {
     };
   });
 
-  if (docsToInsert.length) {
-    await PromotionLevelTemplate.insertMany(docsToInsert, { ordered: true });
+  try {
+    await insertInitialClubTemplates(clubId, docsToInsert);
+  } catch (e) {
+    // Dos peticiones a la vez para un club nuevo: la otra ya creó las plantillas
+    // (índice único scope+club+levelNumber). No es un error: usamos las suyas.
+    if (!isDuplicateKeyError(e)) throw e;
   }
 
   clubTemplates = await PromotionLevelTemplate.find({ scope: 'club', club: clubId })
@@ -1661,6 +1745,92 @@ exports.getClubPromotionConfig = async (req, res) => {
   }
 };
 
+/**
+ * Valida TODOS los niveles con el esquema real ANTES de tocar la base de datos.
+ * Devuelve la lista de problemas (vacía si todo está bien).
+ */
+async function validateLevelDocs(docs) {
+  const problems = [];
+
+  const seen = new Map();
+  docs.forEach((d, idx) => {
+    const n = Number(d.levelNumber);
+    if (seen.has(n)) {
+      problems.push({ levelIndex: idx, levelNumber: n, path: 'levelNumber', message: `Número de nivel repetido (también en la posición ${seen.get(n)})` });
+    } else {
+      seen.set(n, idx);
+    }
+  });
+
+  for (let idx = 0; idx < docs.length; idx++) {
+    try {
+      await new PromotionLevelTemplate(docs[idx]).validate();
+    } catch (e) {
+      const errors = e?.errors ? Object.values(e.errors) : [e];
+      for (const err of errors) {
+        problems.push({
+          levelIndex: idx,
+          levelNumber: docs[idx].levelNumber,
+          path: err?.path || null,
+          message: err?.message || String(err),
+        });
+      }
+    }
+  }
+
+  return problems;
+}
+
+/**
+ * Sustituye TODOS los niveles del club por `docs` sin riesgo de dejarlo vacío.
+ *  1) Con transacción (Atlas / réplica): borrar + insertar en la misma sesión;
+ *     si algo falla, Mongo deshace todo.
+ *  2) Sin transacciones (servidor standalone): se guarda copia de los niveles
+ *     actuales, se borra e inserta, y si la inserción falla se RESTAURA la copia.
+ *     No es atómico ante una caída del proceso a mitad, pero cubre cualquier
+ *     error de inserción.
+ * Si falla, lanza el error: la configuración anterior sigue en la BD.
+ */
+async function replaceClubTemplates(clubId, docs) {
+  const filter = { scope: 'club', club: clubId };
+
+  const doneInTransaction = await runInTransactionIfSupported(async (session) => {
+    await PromotionLevelTemplate.deleteMany(filter, { session });
+    if (docs.length) {
+      await PromotionLevelTemplate.insertMany(docs, { session, ordered: true });
+    }
+  });
+  if (doneInTransaction) return 'transaction';
+
+  const previous = await PromotionLevelTemplate.find(filter).lean();
+  await PromotionLevelTemplate.deleteMany(filter);
+  try {
+    if (docs.length) {
+      await PromotionLevelTemplate.insertMany(docs, { ordered: true });
+    }
+    return 'restore_on_failure';
+  } catch (insertErr) {
+    try {
+      await PromotionLevelTemplate.deleteMany(filter); // restos de una inserción parcial
+      if (previous.length) {
+        await PromotionLevelTemplate.insertMany(previous, { ordered: true });
+      }
+      console.error('[promotions] Fallo al guardar niveles; configuración anterior restaurada', {
+        clubId: String(clubId),
+        error: insertErr?.message || insertErr,
+      });
+    } catch (restoreErr) {
+      // Último recurso: dejar la copia en el log para poder recuperarla a mano.
+      console.error(
+        '🚨 [promotions] NO se pudo restaurar la configuración del club tras un fallo. Copia:',
+        JSON.stringify({ clubId: String(clubId), levels: previous }),
+        restoreErr
+      );
+    }
+    throw insertErr;
+  }
+}
+
 exports.upsertClubLevelOverrides = async (req, res) => {
   try {
     const { clubId } = req.params;
@@ -1676,6 +1846,11 @@ exports.upsertClubLevelOverrides = async (req, res) => {
     if (!payloadLevels) {
       return res.status(400).json({ ok: false, error: 'Missing levels array' });
     }
+    // Una lista vacía borraría todo y en la siguiente carga volverían las
+    // plantillas por defecto sin avisar: casi seguro un error del cliente.
+    if (!payloadLevels.length) {
+      return res.status(400).json({ ok: false, error: 'no_levels', message: 'Debe haber al menos un nivel' });
+    }
 
     const docsToInsert = payloadLevels.map((level, idx) => ({
       scope: 'club',
@@ -1683,19 +1858,28 @@ exports.upsertClubLevelOverrides = async (req, res) => {
       ...normalizeLevelInput(level, idx),
     }));
 
-    // Validar ANTES de borrar nada: si falla, la configuración actual queda intacta.
+    // ---- Validar TODO antes de tocar la BD: si falla, 400 y nada cambia ----
     const invalid = findInvalidPhotoCriteria(docsToInsert);
     if (invalid) {
       return res.status(400).json({ ok: false, ...invalid });
     }
+    const problems = await validateLevelDocs(docsToInsert);
+    if (problems.length) {
+      return res.status(400).json({ ok: false, error: 'invalid_levels', problems });
+    }
 
     await ensureClubTemplates(clubId);
 
-    // Reemplazo completo de la configuración del club para simplificar la primera versión.
-    await PromotionLevelTemplate.deleteMany({ scope: 'club', club: clubId });
-
-    if (docsToInsert.length) {
-      await PromotionLevelTemplate.insertMany(docsToInsert, { ordered: true });
+    // Reemplazo completo de la configuración del club, sin poder dejarla vacía.
+    try {
+      await replaceClubTemplates(clubId, docsToInsert);
+    } catch (saveErr) {
+      console.error('[promotions] upsertClubLevelOverrides: no se guardó:', saveErr?.message || saveErr);
+      return res.status(500).json({
+        ok: false,
+        error: 'save_failed',
+        message: 'No se han guardado los cambios. Tu configuración anterior sigue intacta.',
+      });
     }
 
     const saved = await PromotionLevelTemplate.find({ scope: 'club', club: clubId })
