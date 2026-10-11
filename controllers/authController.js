@@ -16,6 +16,7 @@ exports.loginWithFacebook = async (req, res) => {
 
     let user = await User.findOne({ facebookId: id });
     if (!user) {
+    
       user = new User({
         facebookId: id,
         username: name || "user",

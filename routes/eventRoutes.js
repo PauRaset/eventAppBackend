@@ -16,6 +16,7 @@ const Ticket = require("../models/Ticket");
 const Club = require("../models/Club");
 const QrScan = require("../models/QrScan");
 const { isPhotoMission } = require("../utils/photoMissions");
+const { reviewPhoto, enqueuePhotoReview } = require("../utils/photoReview");
 const { makeToken } = require("../utils/ticketToken");
 const User = require("../models/User");
 const Notification = require("../models/Notification");
@@ -785,6 +786,9 @@ async function resolvePhotoMissionForUpload({ userId, event, missionKey }) {
     missionTarget: Number(mission.target || 1),
     missionCurrent: Number(mission.current || 0),
     levelNumber: Number(level.levelNumber),
+    // Para la revisión con IA (no se guardan en la foto)
+    photoCriteria: String(mission.photoCriteria || ''),
+    photoCriteriaExclude: String(mission.photoCriteriaExclude || ''),
   };
 }
 
@@ -1035,6 +1039,71 @@ const storage = multer.diskStorage({
 const upload = multer({ storage });
 // Para aceptar múltiples campos/arrays con nombres distintos:
 const uploadAny = multer({ storage });
+
+/**
+ * Revisión con IA de una foto ya guardada (se ejecuta en segundo plano).
+ *  - Moderación bloquea   -> status 'rejected' y se BORRA el archivo (no se guarda contenido explícito).
+ *  - Misión no cumplida   -> status 'rejected' (archivo conservado), solo si seguía 'pending'.
+ *  - IA aprueba           -> sigue 'pending' (v1: el club tiene la última palabra).
+ *  - needs_review / fallo -> sigue 'pending'.
+ * Nunca lanza: un fallo de la IA no bloquea a nadie ni pierde la foto.
+ */
+async function runPhotoReview({ eventId, photoId, imagePath, isMissionPhoto, photoCriteria, photoCriteriaExclude }) {
+  let result = await reviewPhoto({
+    imagePath,
+    photoCriteria,
+    photoCriteriaExclude,
+    logContext: { eventId: String(eventId), photoId },
+  });
+
+  // Foto de misión sin criterio definido (misión aún no migrada): la IA no puede
+  // validar la misión, así que lo que no sea un bloqueo de moderación lo revisa el club.
+  if (isMissionPhoto && !String(photoCriteria || "").trim() && result.moderation !== "blocked") {
+    result = {
+      ...result,
+      status: "needs_review",
+      reason: "La misión no tiene criterio de foto definido; la revisa el club.",
+    };
+  }
+
+  const ai = {
+    "photos.$.aiStatus": result.status,
+    "photos.$.aiReason": String(result.reason || "").slice(0, 500),
+    "photos.$.aiConfidence": result.confidence ?? null,
+    "photos.$.aiCheckedAt": new Date(),
+  };
+
+  try {
+    if (result.moderation === "blocked") {
+      // Rechazo directo, aunque el club ya la hubiera tocado: contenido explícito fuera.
+      await Event.updateOne(
+        { _id: eventId, "photos.photoId": photoId },
+        { $set: { ...ai, "photos.$.status": "rejected", "photos.$.validationResult": "ai_blocked" } }
+      );
+      try {
+        fs.unlinkSync(imagePath);
+      } catch (e) {
+        console.warn("[photoReview] no se pudo borrar el archivo bloqueado:", imagePath, e?.message || e);
+      }
+      console.warn("[photoReview] foto BLOQUEADA por moderación y archivo borrado", { eventId: String(eventId), photoId });
+      return;
+    }
+
+    if (result.status === "rejected") {
+      // Misión no cumplida: rechazo, pero sin pisar una decisión del club ya tomada.
+      const r = await Event.updateOne(
+        { _id: eventId, photos: { $elemMatch: { photoId, status: "pending" } } },
+        { $set: { ...ai, "photos.$.status": "rejected", "photos.$.validationResult": "ai_not_matched" } }
+      );
+      if ((r.n ?? r.matchedCount) === 1) return;
+    }
+
+    // approved (sigue pending en v1), needs_review, o rechazo cuando el club ya decidió
+    await Event.updateOne({ _id: eventId, "photos.photoId": photoId }, { $set: ai });
+  } catch (e) {
+    console.warn("[photoReview] no se pudo guardar el resultado:", e?.message || e, { eventId: String(eventId), photoId });
+  }
+}
 
 /** Borra los temporales de multer de una subida que se rechaza antes de procesarla. */
 function cleanupUploadedFiles(files) {
@@ -3081,6 +3150,11 @@ router.get("/:id/photos/moderation", anyAuth, ensureUserId, async (req, res) => 
       missionTarget: p.missionTarget ?? null,
       levelNumber: p.levelNumber ?? null,
       viaQrScan: !!p.viaQrScan,
+      // Qué opinó la IA (orientativo: la decisión es `status`, que toma el club)
+      aiStatus: p.aiStatus || "not_run",
+      aiReason: p.aiReason || "",
+      aiConfidence: p.aiConfidence ?? null,
+      aiCheckedAt: p.aiCheckedAt || null,
       validatedForMissionType: p.validatedForMissionType || null,
       validatedForMissionId: p.validatedForMissionId || null,
       validatedForMissionTitle: p.validatedForMissionTitle || null,
@@ -3402,6 +3476,7 @@ async function postPhotosHandler(req, res) {
     ensureDir(eventPhotosDir);
 
     const savedMeta = [];
+    const reviewJobs = []; // revisión con IA en segundo plano, tras responder
     for (const f of files) {
       const base = `event-${id}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
       const processed = await processImageToJpg(f.path, eventPhotosDir, base);
@@ -3429,6 +3504,7 @@ async function postPhotosHandler(req, res) {
         missionCurrent: missionMeta.missionCurrent,
         missionTarget: missionMeta.missionTarget,
         viaQrScan: req.viaQrScan === true,
+        aiStatus: "not_run",
         validatedForMissionType: null,
         validatedForMissionId: null,
         validatedForMissionTitle: null,
@@ -3440,6 +3516,14 @@ async function postPhotosHandler(req, res) {
       event.photos = Array.isArray(event.photos) ? event.photos : [];
       event.photos.push(meta);
       savedMeta.push(meta);
+      reviewJobs.push({
+        eventId: event._id,
+        photoId: meta.photoId,
+        imagePath: processed,
+        isMissionPhoto: !!missionMeta.missionId,
+        photoCriteria: missionMeta.photoCriteria || "",
+        photoCriteriaExclude: missionMeta.photoCriteriaExclude || "",
+      });
     }
 
     await event.save();
@@ -3467,6 +3551,11 @@ async function postPhotosHandler(req, res) {
     const allPhotos = approvedOnly(event.photos)
       .map((p) => toPhotoTileAbs(req, p, req.user?.id || null))
       .filter(Boolean);
+
+    // Revisión con IA en SEGUNDO PLANO: el usuario no espera a la IA en la puerta.
+    for (const job of reviewJobs) {
+      enqueuePhotoReview(() => runPhotoReview(job));
+    }
 
     return res.status(201).json({
       uploaded,        // recién subidas (con autor)
