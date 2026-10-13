@@ -51,6 +51,12 @@ const eventPhotoSchema = new mongoose.Schema(
     aiConfidence: { type: Number, default: null },  // 0..1
     aiCheckedAt: { type: Date, default: null },
 
+    // Quién tomó la decisión final de `status`: 'club' (una persona desde el
+    // portal) o 'ai' (aprobación automática, o rechazo por moderación/misión).
+    // null = nadie todavía (pending) o fotos anteriores a este campo.
+    // Si es 'ai', reviewedBy queda a null (no hay usuario detrás).
+    reviewSource: { type: String, enum: ["club", "ai", null], default: null },
+
     // moderation result metadata saved by the club when approving/rejecting the photo
     validatedForMissionType: { type: String, default: null },
     validatedForMissionId: { type: String, default: null },

@@ -16,7 +16,7 @@ const Ticket = require("../models/Ticket");
 const Club = require("../models/Club");
 const QrScan = require("../models/QrScan");
 const { isPhotoMission } = require("../utils/photoMissions");
-const { reviewPhoto, enqueuePhotoReview } = require("../utils/photoReview");
+const { reviewPhoto, enqueuePhotoReview, getAutoApproveMin } = require("../utils/photoReview");
 const { makeToken } = require("../utils/ticketToken");
 const User = require("../models/User");
 const Notification = require("../models/Notification");
@@ -1041,14 +1041,56 @@ const upload = multer({ storage });
 const uploadAny = multer({ storage });
 
 /**
+ * Efectos de APROBAR una foto, iguales la apruebe el club o la IA:
+ *  - avisar a los asistentes de que hay foto nueva,
+ *  - avanzar la misión de la foto (solo si countForMission: no en re-aprobaciones).
+ * `req` solo se usa para construir URLs absolutas (en segundo plano: pseudo-req).
+ */
+async function applyPhotoApprovalEffects({ req, event, photo, countForMission }) {
+  await createNewEventPhotoNotifications({ req, event, photo });
+
+  // Promotions: solo cuenta cuando está aprobada, una sola vez, y SOLO para la
+  // misión que lleva la foto (sin missionId = foto del muro: no avanza nada).
+  const clubId = event.createdBy ? String(event.createdBy._id || event.createdBy) : null;
+  const uploaderId = photo.by ? String(photo.by) : null;
+  if (clubId && uploaderId && countForMission) {
+    await syncPromotionAfterPhotoApproved({
+      userId: uploaderId,
+      clubId,
+      eventId: String(event._id),
+      missionType: photo.validatedForMissionType || photo.missionType || null,
+      missionKey: photo.validatedForMissionId || photo.missionId || null,
+      missionTitle: photo.validatedForMissionTitle || photo.missionTitle || null,
+      levelNumber: photo.validatedForLevelNumber ?? photo.levelNumber ?? null,
+    });
+  }
+}
+
+/** req mínimo para absUrlFromUpload cuando no hay petición (tareas en segundo plano). */
+function pseudoReqFromBase(base) {
+  try {
+    const u = new URL(base);
+    return { protocol: u.protocol.replace(":", ""), get: (h) => (String(h).toLowerCase() === "host" ? u.host : undefined) };
+  } catch {
+    return { protocol: "https", get: () => "api.nightvibe.life" };
+  }
+}
+
+/**
  * Revisión con IA de una foto ya guardada (se ejecuta en segundo plano).
- *  - Moderación bloquea   -> status 'rejected' y se BORRA el archivo (no se guarda contenido explícito).
- *  - Misión no cumplida   -> status 'rejected' (archivo conservado), solo si seguía 'pending'.
- *  - IA aprueba           -> sigue 'pending' (v1: el club tiene la última palabra).
- *  - needs_review / fallo -> sigue 'pending'.
+ *  - Moderación bloquea      -> status 'rejected' y se BORRA el archivo, con CUALQUIER confianza.
+ *  - Misión no cumplida      -> status 'rejected' (archivo conservado), solo si seguía 'pending'.
+ *  - IA aprueba una MISIÓN con confianza >= PHOTO_REVIEW_AUTO_APPROVE_MIN (0.90)
+ *                            -> status 'approved' automáticamente, mismo camino que el club
+ *                               (notificaciones + avance de la misión), reviewSource 'ai'.
+ *  - IA aprueba con menos confianza, o foto del MURO -> sigue 'pending' para el club
+ *    (en el muro la IA solo hace moderación: su 'approved' = "nada prohibido").
+ *  - needs_review / fallo    -> sigue 'pending'.
+ * Las decisiones de la IA solo se aplican si la foto sigue 'pending': nunca pisan
+ * una decisión del club (salvo el bloqueo por moderación, que siempre actúa).
  * Nunca lanza: un fallo de la IA no bloquea a nadie ni pierde la foto.
  */
-async function runPhotoReview({ eventId, photoId, imagePath, isMissionPhoto, photoCriteria, photoCriteriaExclude }) {
+async function runPhotoReview({ eventId, photoId, imagePath, isMissionPhoto, photoCriteria, photoCriteriaExclude, publicBase }) {
   let result = await reviewPhoto({
     imagePath,
     photoCriteria,
@@ -1073,12 +1115,27 @@ async function runPhotoReview({ eventId, photoId, imagePath, isMissionPhoto, pho
     "photos.$.aiCheckedAt": new Date(),
   };
 
+  // Decisión tomada por la IA (sin persona detrás)
+  const aiDecision = {
+    "photos.$.reviewSource": "ai",
+    "photos.$.reviewedBy": null,
+    "photos.$.reviewedAt": new Date(),
+  };
+
   try {
     if (result.moderation === "blocked") {
       // Rechazo directo, aunque el club ya la hubiera tocado: contenido explícito fuera.
+      // El umbral de confianza NO aplica a la moderación.
       await Event.updateOne(
         { _id: eventId, "photos.photoId": photoId },
-        { $set: { ...ai, "photos.$.status": "rejected", "photos.$.validationResult": "ai_blocked" } }
+        {
+          $set: {
+            ...ai,
+            ...aiDecision,
+            "photos.$.status": "rejected",
+            "photos.$.validationResult": "ai_blocked",
+          },
+        }
       );
       try {
         fs.unlinkSync(imagePath);
@@ -1093,12 +1150,66 @@ async function runPhotoReview({ eventId, photoId, imagePath, isMissionPhoto, pho
       // Misión no cumplida: rechazo, pero sin pisar una decisión del club ya tomada.
       const r = await Event.updateOne(
         { _id: eventId, photos: { $elemMatch: { photoId, status: "pending" } } },
-        { $set: { ...ai, "photos.$.status": "rejected", "photos.$.validationResult": "ai_not_matched" } }
+        {
+          $set: {
+            ...ai,
+            ...aiDecision,
+            "photos.$.status": "rejected",
+            "photos.$.validationResult": "ai_not_matched",
+          },
+        }
       );
       if ((r.n ?? r.matchedCount) === 1) return;
     }
 
-    // approved (sigue pending en v1), needs_review, o rechazo cuando el club ya decidió
+    // Aprobación AUTOMÁTICA: solo fotos de MISIÓN, solo con confianza alta.
+    const minConfidence = getAutoApproveMin();
+    if (
+      result.status === "approved" &&
+      isMissionPhoto &&
+      typeof result.confidence === "number" &&
+      result.confidence >= minConfidence
+    ) {
+      // Atómica y condicionada: solo si sigue 'pending' (el club no ha decidido
+      // mientras tanto) y no está bloqueada. Así nunca cuenta dos veces.
+      const r = await Event.updateOne(
+        {
+          _id: eventId,
+          photos: { $elemMatch: { photoId, status: "pending", validationResult: { $ne: "ai_blocked" } } },
+        },
+        {
+          $set: {
+            ...ai,
+            ...aiDecision,
+            "photos.$.status": "approved",
+            "photos.$.validationResult": "ai_matched",
+          },
+        }
+      );
+
+      if ((r.n ?? r.matchedCount) === 1) {
+        const event = await Event.findById(eventId).select("_id title createdBy attendees photos").lean();
+        const photo = (event?.photos || []).find((p) => p && p.photoId === photoId);
+        if (event && photo) {
+          await applyPhotoApprovalEffects({
+            req: pseudoReqFromBase(publicBase),
+            event,
+            photo,
+            countForMission: true,
+          });
+        }
+        console.log("[photoReview] foto de misión APROBADA automáticamente", {
+          eventId: String(eventId),
+          photoId,
+          confidence: result.confidence,
+          minConfidence,
+        });
+        return;
+      }
+    }
+
+    // approved sin aprobación automática (muro, poca confianza o el club ya
+    // decidió), needs_review, o rechazo cuando el club ya decidió: solo datos de la IA.
     await Event.updateOne({ _id: eventId, "photos.photoId": photoId }, { $set: ai });
   } catch (e) {
     console.warn("[photoReview] no se pudo guardar el resultado:", e?.message || e, { eventId: String(eventId), photoId });
@@ -3155,6 +3266,8 @@ router.get("/:id/photos/moderation", anyAuth, ensureUserId, async (req, res) => 
       aiReason: p.aiReason || "",
       aiConfidence: p.aiConfidence ?? null,
       aiCheckedAt: p.aiCheckedAt || null,
+      // Quién decidió el status: 'club' | 'ai' | null (pendiente / antiguo)
+      reviewSource: p.reviewSource || null,
       validatedForMissionType: p.validatedForMissionType || null,
       validatedForMissionId: p.validatedForMissionId || null,
       validatedForMissionTitle: p.validatedForMissionTitle || null,
@@ -3204,6 +3317,7 @@ router.post("/:id/photos/:photoId/approve", anyAuth, ensureUserId, async (req, r
     event.photos[idx].status = "approved";
     event.photos[idx].reviewedBy = req.user.id;
     event.photos[idx].reviewedAt = new Date();
+    event.photos[idx].reviewSource = "club";
     event.photos[idx].reviewNote = note;
     event.photos[idx].validatedForMissionType = validationMeta.validatedForMissionType;
     event.photos[idx].validatedForMissionId = validationMeta.validatedForMissionId;
@@ -3213,42 +3327,13 @@ router.post("/:id/photos/:photoId/approve", anyAuth, ensureUserId, async (req, r
 
     await event.save();
 
-    const approvedPhoto = event.photos[idx];
-
-    // Notifications: avisar a asistentes cuando una foto pasa a estar visible.
-    await createNewEventPhotoNotifications({
+    // Mismo camino que la aprobación automática de la IA (runPhotoReview).
+    await applyPhotoApprovalEffects({
       req,
       event,
-      photo: approvedPhoto,
+      photo: event.photos[idx],
+      countForMission: !wasApproved,
     });
-
-    // Promotions: solo cuenta cuando está aprobada, una sola vez, y SOLO para la
-    // misión que lleva la foto (sin missionId = foto del muro: no avanza nada).
-    const clubId = event.createdBy ? event.createdBy.toString() : null;
-    const uploaderId = approvedPhoto.by ? approvedPhoto.by.toString() : null;
-    if (clubId && uploaderId && !wasApproved) {
-      await syncPromotionAfterPhotoApproved({
-        userId: uploaderId,
-        clubId,
-        eventId: id,
-        missionType:
-          approvedPhoto.validatedForMissionType ||
-          approvedPhoto.missionType ||
-          null,
-        missionKey:
-          approvedPhoto.validatedForMissionId ||
-          approvedPhoto.missionId ||
-          null,
-        missionTitle:
-          approvedPhoto.validatedForMissionTitle ||
-          approvedPhoto.missionTitle ||
-          null,
-        levelNumber:
-          approvedPhoto.validatedForLevelNumber ??
-          approvedPhoto.levelNumber ??
-          null,
-      });
-    }
 
     return res.json({
       ok: true,
@@ -3301,6 +3386,7 @@ router.post("/:id/photos/:photoId/reject", anyAuth, ensureUserId, async (req, re
     event.photos[idx].status = "rejected";
     event.photos[idx].reviewedBy = req.user.id;
     event.photos[idx].reviewedAt = new Date();
+    event.photos[idx].reviewSource = "club";
     event.photos[idx].reviewNote = note;
     event.photos[idx].validatedForMissionType = validationMeta.validatedForMissionType;
     event.photos[idx].validatedForMissionId = validationMeta.validatedForMissionId;
@@ -3536,6 +3622,7 @@ async function postPhotosHandler(req, res) {
         isMissionPhoto: !!missionMeta.missionId,
         photoCriteria: missionMeta.photoCriteria || "",
         photoCriteriaExclude: missionMeta.photoCriteriaExclude || "",
+        publicBase: backendBase(req), // para URLs absolutas en las notificaciones
       });
     }
 

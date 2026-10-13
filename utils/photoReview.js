@@ -32,6 +32,22 @@ const JPEG_QUALITY = 70; // calidad media: solo es la copia que se envía
 // ("ante la duda, needs_review"). No aplica a la moderación.
 const MIN_CONFIDENCE = 0.75;
 
+// Aprobación AUTOMÁTICA de fotos de misión: solo si la IA aprueba con al menos
+// esta confianza (PHOTO_REVIEW_AUTO_APPROVE_MIN, por defecto 0.90). No afecta a
+// la moderación (un bloqueo actúa siempre) ni a las fotos del muro (nunca se
+// aprueban solas). Un valor > 1 desactiva la aprobación automática.
+const DEFAULT_AUTO_APPROVE_MIN = 0.9;
+function getAutoApproveMin() {
+  const raw = String(process.env.PHOTO_REVIEW_AUTO_APPROVE_MIN ?? '').trim();
+  if (!raw) return DEFAULT_AUTO_APPROVE_MIN;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0) {
+    console.warn(`[photoReview] PHOTO_REVIEW_AUTO_APPROVE_MIN no válido ("${raw}"); uso ${DEFAULT_AUTO_APPROVE_MIN}.`);
+    return DEFAULT_AUTO_APPROVE_MIN;
+  }
+  return n;
+}
+
 let anthropicClient = null;
 let warnedNoKey = false;
 
@@ -358,4 +374,11 @@ function enqueuePhotoReview(job) {
   setImmediate(pump);
 }
 
-module.exports = { reviewPhoto, reviewPhotoDetailed, enqueuePhotoReview, getModel, DEFAULT_MODEL };
+module.exports = {
+  reviewPhoto,
+  reviewPhotoDetailed,
+  enqueuePhotoReview,
+  getModel,
+  DEFAULT_MODEL,
+  getAutoApproveMin,
+};
