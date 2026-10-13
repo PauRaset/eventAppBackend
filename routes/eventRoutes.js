@@ -3187,6 +3187,15 @@ router.post("/:id/photos/:photoId/approve", anyAuth, ensureUserId, async (req, r
     const idx = (event.photos || []).findIndex((p) => p && typeof p === "object" && String(p.photoId || "") === String(photoId));
     if (idx === -1) return res.status(404).json({ message: "Foto no encontrada" });
 
+    // Bloqueada por la moderación de la IA: el archivo ya se borró y la decisión
+    // no se revierte. Rechazar o eliminar sí se puede; aprobar, no.
+    if (event.photos[idx].validationResult === "ai_blocked") {
+      return res.status(409).json({
+        error: "blocked_by_moderation",
+        message: "Esta foto fue bloqueada por contenido no permitido y no se puede aprobar.",
+      });
+    }
+
     const note = (req.body?.reviewNote || "").toString();
     const validationMeta = extractPhotoValidationMeta(req.body || {});
     // Re-aprobar una foto ya aprobada no debe volver a sumar a la misión
@@ -3297,7 +3306,11 @@ router.post("/:id/photos/:photoId/reject", anyAuth, ensureUserId, async (req, re
     event.photos[idx].validatedForMissionId = validationMeta.validatedForMissionId;
     event.photos[idx].validatedForMissionTitle = validationMeta.validatedForMissionTitle;
     event.photos[idx].validatedForLevelNumber = validationMeta.validatedForLevelNumber;
-    event.photos[idx].validationResult = validationMeta.validationResult || "not_matched";
+    // Una foto bloqueada por moderación conserva la marca: si se perdiera al
+    // rechazarla, después se podría aprobar (ver el 409 de /approve).
+    if (event.photos[idx].validationResult !== "ai_blocked") {
+      event.photos[idx].validationResult = validationMeta.validationResult || "not_matched";
+    }
 
     await event.save();
 
