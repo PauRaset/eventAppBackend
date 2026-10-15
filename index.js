@@ -425,6 +425,25 @@ async function resolveConnectedAccount({ clubId, eventId }) {
   return { destinationAccount: null, clubId: null, reason: "not_found" };
 }
 
+// ===== POST /api/orders: RETIRADA =====
+// Aceptaba el precio desde el cliente (items[].unitAmount) y el webhook emite las
+// entradas sin comprobar el importe. Sin uso en producción: la app compra por
+// /api/payments/checkout y la web por /api/payments/direct. No crea nada.
+app.post("/api/orders", (req, res) => {
+  console.warn("[orders] POST /api/orders retirada, llamada rechazada", {
+    ip: req.ip,
+    ua: req.get("user-agent") || "",
+    eventId: req.body?.eventId || "",
+  });
+  return res.status(410).json({
+    error: "endpoint_retired",
+    message: "Actualiza la app para comprar entradas",
+  });
+});
+
+// Código original, comentado por si hay que volver atrás.
+// resolveConnectedAccount (arriba) solo lo usaba esta ruta; se deja por lo mismo.
+/*
 // ===== Stripe Checkout: crear orden (con validación + payouts Connect) =====
 app.post("/api/orders", async (req, res) => {
   try {
@@ -621,6 +640,8 @@ app.post("/api/orders", async (req, res) => {
     });
   }
 });
+*/
+// ===== fin POST /api/orders retirada =====
 
 /* ========= Endpoints de lectura de órdenes para el front ========= */
 // Rutas públicas (sin auth): límite estricto para que no se puedan enumerar ids.

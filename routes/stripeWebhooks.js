@@ -4,6 +4,7 @@ const Stripe2 = require('stripe');
 const crypto = require('crypto');
 const QRCode = require('qrcode');
 const Order2 = require('../models/Order');
+const UnmatchedPayment = require('../models/UnmatchedPayment');
 let ShareLink;
 try {
   ShareLink = require('../models/ShareLink');
@@ -132,35 +133,49 @@ router2.post('/', express2.raw({ type: 'application/json' }), async (req, res) =
       }
 
       if (!order) {
-        console.warn(
-          '[stripe webhook] no Order found for session, creating on the fly:',
-          sessionId
-        );
-
-        const amountTotal = typeof session.amount_total === 'number'
-          ? session.amount_total
-          : null;
-
-        order = await Order2.create({
-          stripeSessionId: sessionId,
+        // Pago que no sale de /checkout ni de /direct (esas crean la orden antes
+        // y mandan su orderId): enlace de pago del panel, otra integración, o el
+        // antiguo POST /api/orders. El importe no está verificado contra ningún
+        // precio, así que NO se emiten entradas: se registra para revisión manual
+        // y se responde 200 para que Stripe no reintente.
+        const reason = meta.orderId ? 'order_id_not_found' : 'no_order_id';
+        const amountTotal = typeof session.amount_total === 'number' ? session.amount_total : null;
+        console.error('[stripe webhook] ⚠️ PAGO SIN ORDEN: NO se emiten entradas, revisar a mano', {
+          reason,
+          sessionId,
           paymentIntentId: session.payment_intent || null,
-          userId: userId || null,
-          eventId: eventId,
-          clubId: meta.clubId || null,
-          qty: qtyMeta,
-          amountEUR: amountTotal ? amountTotal / 100 : undefined,
-          currency: session.currency || 'eur',
+          amountTotalCents: amountTotal,
+          currency: session.currency || null,
           email: stripeEmail,
-          status: 'paid',
-          refCode: refCode || null,
-          refUserId: refUserId || null,
-          shareChannel: shareChannel || null,
-          sessionMetadata: {
-            ...(meta || {}),
-            ...(refCode ? { refCode } : {}),
-            ...(shareChannel ? { shareChannel } : {}),
-          },
+          livemode: session.livemode,
+          stripeEventId: event.id,
+          metadata: meta,
         });
+        try {
+          await UnmatchedPayment.updateOne(
+            { stripeSessionId: sessionId },
+            {
+              $setOnInsert: {
+                stripeSessionId: sessionId,
+                paymentIntentId: session.payment_intent || null,
+                amountTotalCents: amountTotal,
+                currency: session.currency || null,
+                email: stripeEmail,
+                livemode: typeof session.livemode === 'boolean' ? session.livemode : null,
+                stripeEventId: event.id || null,
+                metadata: meta,
+                reason,
+              },
+            },
+            { upsert: true }
+          );
+        } catch (e) {
+          // Reintento simultáneo de Stripe (E11000): ya está registrado
+          if (!(e && e.code === 11000)) {
+            console.error('[stripe webhook] no se pudo registrar el pago sin orden:', sessionId, e?.message || e);
+          }
+        }
+        return res.json({ ok: true, unmatched: true, ticketsIssued: false });
       } else {
         // Order existente: idempotencia
         if (order.status === 'paid' && order.ticketsIssuedAt) {
