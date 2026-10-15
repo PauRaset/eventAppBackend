@@ -1674,6 +1674,17 @@ exports.redeemCurrentLevelReward = async (req, res) => {
     progress.lastActivityAt = now();
     await progress.save();
 
+    // El nivel recién desbloqueado recibe el acumulado de referidos del club
+    // (share_event / link_clicks / referred_purchases). Carga perezosa.
+    try {
+      await require('../routes/eventRoutes').syncReferralMissions({
+        userId: String(mongoUser._id),
+        clubKey: String(clubId),
+      });
+    } catch (e) {
+      console.warn('[promotions] redeem: referral sync falló:', e?.message || e);
+    }
+
     const clubDoc = ClubModel && clubId
       ? await ClubModel.findById(clubId).lean()
       : null;

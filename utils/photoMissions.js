@@ -44,7 +44,7 @@ const DEFAULT_PHOTO_CRITERIA = Object.freeze({
   photocall_photo:
     'Una foto de al menos dos personas posando delante del photocall del local.',
   show_prizes_photo:
-    'Una foto donde se vean claramente premios o recompensas conseguidas en el club (pulseras, consumiciones, entradas o similares).',
+    'Una foto donde se vean claramente premios o recompensas conseguidas en el club: pulseras, consumiciones, entradas o similares.',
   stamps_competition:
     'Una foto de la cara de la persona donde se vean claramente los sellos conseguidos durante el evento.',
 });

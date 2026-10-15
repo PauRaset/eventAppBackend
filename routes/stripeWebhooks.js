@@ -22,6 +22,27 @@ const stripe2 = new Stripe2(process.env.STRIPE_SECRET_KEY, {
 // Serial y token del QR: compartidos con /api/events/my-tickets/:ticketId/qr
 const { genSerial, makeToken } = require('../utils/ticketToken');
 
+/**
+ * Recalcula la misión referred_purchases de quien compartió el enlace de esta
+ * orden. En segundo plano y sin lanzar nunca: un fallo aquí no debe afectar al
+ * pago, a la emisión de tickets ni a la respuesta a Stripe.
+ * (Carga perezosa de eventRoutes para no depender del orden de carga.)
+ */
+function syncReferralForOrder(order, motivo) {
+  setImmediate(() => {
+    Promise.resolve()
+      .then(() =>
+        require('./eventRoutes').syncReferralForEvent({
+          userKey: order.refUserId,
+          eventId: String(order.eventId),
+        })
+      )
+      .catch((e) =>
+        console.warn(`[stripe webhook] referral sync (${motivo}) falló:`, e?.message || e)
+      );
+  });
+}
+
 async function sendTicketEmailWithRetry(payload, { attempts = 3, baseDelayMs = 800 } = {}) {
   let lastErr;
   for (let i = 1; i <= attempts; i++) {
@@ -168,6 +189,12 @@ router2.post('/', express2.raw({ type: 'application/json' }), async (req, res) =
         order.refUserId = refUserId || order.refUserId || null;
 
         await order.save();
+      }
+
+      // Misión referred_purchases de quien compartió el enlace (recalcula desde
+      // los datos: idempotente si Stripe reintenta). No bloquea la emisión de tickets.
+      if (order.refUserId) {
+        syncReferralForOrder(order, 'pago');
       }
 
       const usedQty = order.qty || qtyMeta || 1;
@@ -343,11 +370,29 @@ router2.post('/', express2.raw({ type: 'application/json' }), async (req, res) =
       event.type === 'charge.refunded' ||
       event.type === 'payment_intent.canceled'
     ) {
-      const pi = event.data.object;
-      await Order2.updateOne(
-        { paymentIntentId: pi.id },
-        { $set: { status: 'refunded' } }
-      );
+      // charge.refunded trae un Charge (su id es ch_…, el pago está en
+      // charge.payment_intent); payment_intent.canceled trae el PaymentIntent.
+      // Antes se buscaba siempre por obj.id, y en los reembolsos nunca casaba.
+      const obj = event.data.object || {};
+      const paymentIntentId =
+        event.type === 'charge.refunded'
+          ? (typeof obj.payment_intent === 'string' ? obj.payment_intent : obj.payment_intent?.id) || null
+          : obj.id || null;
+
+      if (paymentIntentId) {
+        const refundedOrder = await Order2.findOneAndUpdate(
+          { paymentIntentId },
+          { $set: { status: 'refunded' } },
+          { new: true }
+        ).lean();
+
+        // referred_purchases se recalcula: la compra reembolsada deja de contar
+        if (refundedOrder?.refUserId) {
+          syncReferralForOrder(refundedOrder, 'reembolso');
+        }
+      } else {
+        console.warn('[stripe webhook] reembolso/cancelación sin payment_intent:', event.type, obj.id);
+      }
       // TODO: invalidar tickets si hace falta
     }
 

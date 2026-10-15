@@ -4,10 +4,16 @@ const router = express.Router();
 const Stripe = require('stripe');
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
+const rateLimit = require('express-rate-limit');
 const Club = require('../models/Club');
 const Order = require('../models/Order');
+const { anyAuthWithId } = require('../middlewares/authMiddleware');
 let User = null;
 try { User = require('../models/User'); } catch (_){}
+let EventModel = null;
+try { EventModel = require('../models/Event'); } catch (_){}
+
+const HEX24 = /^[a-fA-F0-9]{24}$/;
 
 /* ======================= Helpers genéricos ======================= */
 function asInt(v, def) {
@@ -90,15 +96,33 @@ function authenticateToken(req, res, next) {
   }
 }
 
-/* (Opcional) Middleware mínimo para asegurar acceso del dueño.
-   De momento sigue permisivo para no romper flujos. */
-async function requireClubOwnerOrManager(req, res, next) {
+/**
+ * Acceso a un club concreto (:id = _id del Club): SOLO su dueño o un manager.
+ * Mismo criterio que el reembolso (canManageOrderClub): ids verificados, y email
+ * solo para cuentas con role 'club' (ver getCallerAccess).
+ * Antes este middleware no comprobaba nada: cualquiera podía sacar el enlace al
+ * panel de Stripe del club, darle de alta su cuenta, regenerar la clave del
+ * escáner o descargar las órdenes con los emails de los compradores.
+ */
+async function checkClubOwnerOrManager(req, res, next) {
   try {
-    const clubId = req.params.id;
+    const clubId = String(req.params.id || '');
+    if (!HEX24.test(clubId)) return res.status(404).json({ error: 'club_not_found' });
+
     const club = await Club.findById(clubId).lean();
     if (!club) return res.status(404).json({ error: 'club_not_found' });
 
-    // TODO: integrar con tu auth real; aquí no bloqueamos.
+    const access = await getCallerAccess(req);
+    if (!clubHasPerson(club, access)) {
+      console.warn('[clubs] acceso DENEGADO', {
+        by: req.user?.id || null,
+        clubId,
+        route: `${req.method} ${req.baseUrl}${req.route?.path || ''}`,
+        ip: req.ip,
+      });
+      return res.status(403).json({ error: 'forbidden', message: 'No tienes permiso sobre este club' });
+    }
+
     req.club = club;
     next();
   } catch (e) {
@@ -106,6 +130,9 @@ async function requireClubOwnerOrManager(req, res, next) {
     res.status(500).json({ error: 'auth_error' });
   }
 }
+
+// Autenticación (JWT del portal o Firebase) + comprobación de dueño/manager
+const requireClubOwnerOrManager = [anyAuthWithId, checkClubOwnerOrManager];
 
 /* ======================= RUTAS BASE ======================= */
 /**
@@ -232,27 +259,140 @@ router.get('/:id/orders.csv', requireClubOwnerOrManager, async (req, res) => {
   }
 });
 
-/* =================== Reembolso básico =================== */
-router.post('/orders/:orderId/refund', async (req, res) => {
+/* =================== Reembolso =================== */
+
+/**
+ * Quién llama, para decidir acceso a un club:
+ *  - ids: _id de Mongo y uid de Firebase (verificados por el middleware de auth).
+ *  - email: SOLO si la cuenta tiene role 'club' (se lee de la BD, no del token).
+ *    Los clubs se dan de alta con ownerUserId = email (registrationRoutes), así
+ *    que sin el email los dueños reales se quedarían fuera. Pero cualquier
+ *    usuario puede cambiarse el email sin verificar (PUT /api/auth/update), y el
+ *    rol 'club' solo se obtiene completando el alta verificada: por eso el email
+ *    solo cuenta para cuentas de club.
+ */
+async function getCallerAccess(req) {
+  const ids = new Set([req.user?.id, req.userId, req.firebaseUser?.uid].filter(Boolean).map(String));
+  let email = null;
+  if (User && ids.size) {
+    const or = [];
+    const mongoIds = [...ids].filter((v) => HEX24.test(v));
+    if (mongoIds.length) or.push({ _id: { $in: mongoIds } });
+    or.push({ firebaseUid: { $in: [...ids] } });
+    const me = await User.findOne({ $or: or }).select('_id firebaseUid email role').lean();
+    if (me?._id) ids.add(String(me._id));
+    if (me?.firebaseUid) ids.add(String(me.firebaseUid));
+    if (me?.role === 'club' && typeof me.email === 'string' && me.email.trim()) {
+      email = me.email.trim().toLowerCase();
+    }
+  }
+  return { ids, email };
+}
+
+/** ¿Es quien llama el dueño o un manager del club? (por id, o por email si es cuenta de club) */
+function clubHasPerson(club, access) {
+  return [club?.ownerUserId, ...((club && club.managers) || [])]
+    .filter(Boolean)
+    .map(String)
+    .some((p) => access.ids.has(p) || (access.email && p.trim().toLowerCase() === access.email));
+}
+
+/**
+ * ¿Puede quien llama gestionar el club de esta orden? Dueño o manager del
+ * Club, o la propia cuenta del club (el portal usa su _id de usuario como club).
+ * Order.clubId puede ser el _id del Club o el del usuario-club, según el flujo
+ * de compra; si no basta, se mira el club del evento.
+ */
+async function canManageOrderClub(req, order) {
+  const access = await getCallerAccess(req);
+  const ids = access.ids;
+  if (!ids.size) return false;
+
+  const orderClubId = String(order.clubId || '');
+  if (orderClubId) {
+    if (ids.has(orderClubId)) return true; // cuenta del propio club
+    if (HEX24.test(orderClubId)) {
+      const club = await Club.findById(orderClubId).select('ownerUserId managers').lean();
+      if (club) return clubHasPerson(club, access);
+    }
+  }
+
+  // Sin club identificable en la orden: el club del evento
+  if (EventModel && HEX24.test(String(order.eventId || ''))) {
+    const ev = await EventModel.findById(order.eventId).select('createdBy club clubId').lean();
+    if (ev?.createdBy && ids.has(String(ev.createdBy))) return true;
+    const clubRef = ev?.club || (HEX24.test(String(ev?.clubId || '')) ? ev.clubId : null);
+    if (clubRef) {
+      const club = await Club.findById(clubRef).select('ownerUserId managers').lean();
+      if (club) return clubHasPerson(club, access);
+    }
+  }
+  return false;
+}
+
+// 30 reembolsos cada 15 min por usuario (va DESPUÉS de la autenticación)
+const refundLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  // Va después de anyAuthWithId: req.user.id siempre existe
+  keyGenerator: (req) => `refund:${req.user.id}`,
+  handler: (_req, res) =>
+    res.status(429).json({ error: 'rate_limited', message: 'Demasiados reembolsos seguidos, espera unos minutos' }),
+});
+
+// POST /api/clubs/orders/:orderId/refund — solo el dueño/manager del club de la orden
+router.post('/orders/:orderId/refund', anyAuthWithId, refundLimiter, async (req, res) => {
+  const orderId = String(req.params.orderId || '');
   try {
-    const orderId = req.params.orderId;
+    if (!HEX24.test(orderId)) return res.status(404).json({ error: 'order_not_found' });
+
     const order = await Order.findById(orderId);
     if (!order) return res.status(404).json({ error: 'order_not_found' });
+
+    if (!(await canManageOrderClub(req, order))) {
+      console.warn('[refund] DENEGADO', { by: req.user?.id || null, orderId, clubId: order.clubId || null, ip: req.ip });
+      return res.status(403).json({ error: 'forbidden', message: 'No puedes reembolsar órdenes de este club' });
+    }
+
+    if (order.status !== 'paid') {
+      return res.status(409).json({ error: 'not_refundable', status: order.status });
+    }
     if (!order.paymentIntentId) {
       return res.status(400).json({ error: 'missing_payment_intent' });
     }
 
-    const refund = await stripe.refunds.create({
-      payment_intent: order.paymentIntentId,
-      // refund_application_fee: true,
-    });
+    // idempotencyKey: dos peticiones a la vez para la misma orden = UN solo reembolso
+    const refund = await stripe.refunds.create(
+      {
+        payment_intent: order.paymentIntentId,
+        // refund_application_fee: true,
+      },
+      { idempotencyKey: `refund_order_${order._id}` }
+    );
 
-    order.status = 'refunded';
-    await order.save();
+    // Condicionado: si dos peticiones llegan a la vez, Stripe ya devuelve el mismo
+    // reembolso (idempotencyKey); aquí solo una lo marca y lo registra.
+    const marked = await Order.updateOne({ _id: order._id, status: 'paid' }, { $set: { status: 'refunded' } });
+    if ((marked.n ?? marked.matchedCount) !== 1) {
+      return res.json({ ok: true, refund, duplicate: true });
+    }
+
+    console.warn('[refund] REEMBOLSO', {
+      by: req.user?.id || null,
+      orderId: String(order._id),
+      clubId: order.clubId || null,
+      eventId: order.eventId || null,
+      amountEUR: order.amountEUR ?? null,
+      paymentIntentId: order.paymentIntentId,
+      refundId: refund?.id || null,
+      ip: req.ip,
+    });
 
     res.json({ ok: true, refund });
   } catch (e) {
-    console.error('POST /orders/:id/refund error:', e);
+    console.error('POST /orders/:id/refund error:', { orderId, by: req.user?.id || null, error: e?.message || e });
     res.status(500).json({ error: 'refund_error', message: e?.message || 'refund_failed' });
   }
 });

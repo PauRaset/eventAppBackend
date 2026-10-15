@@ -225,260 +225,112 @@ PromotionLevelTemplateSchema.pre('save', function (next) {
 });
 
 /**
- * Helper: plantillas default (10 niveles) en castellano.
- * Lo dejo aquí para que luego podamos “seedear” fácil desde un script o al arrancar.
+ * Plantillas por defecto: catálogo de 10 niveles (versión 2, octubre 2026).
+ * Las usan scripts/seedPromotionTemplates.js (plantillas globales) y
+ * ensureClubTemplates cuando no hay globales. Cada nivel N lleva al N+1.
+ * Todas las misiones de foto llevan photoCriteria (lo usa la IA) y la misma
+ * exclusión. `version: 2` para que el seed actualice las globales existentes
+ * (solo sobrescribe si la versión entrante es mayor, o con --force).
  */
+const CATALOG_VERSION = 2;
+const PHOTO_EXCLUDE = 'Capturas de pantalla, fotos de otra pantalla o imágenes descargadas de internet.';
+
 PromotionLevelTemplateSchema.statics.getDefaultTemplates = function () {
+  const level = (levelNumber, name, difficulty, description, missions, reward) => ({
+    scope: 'global',
+    levelNumber,
+    order: levelNumber,
+    title: `Nivel ${levelNumber} — ${name}`,
+    description,
+    difficulty,
+    status: 'active',
+    version: CATALOG_VERSION,
+    missions: missions.map((m, idx) => ({ order: idx + 1, ...m })),
+    reward,
+  });
+
+  // Misión de foto: la valida la IA y, si duda, el club.
+  const photo = (m) => ({
+    validationType: 'hybrid',
+    requiresApproval: true,
+    unit: 'photos',
+    photoCriteriaExclude: PHOTO_EXCLUDE,
+    ...m,
+  });
+
   return withDefaultPhotoCriteria([
-    {
-      scope: 'global',
-      levelNumber: 1,
-      title: 'Nivel 1 — Primer paso',
-      description: 'Asiste a un evento y sube una foto del local en NightVibe.',
-      order: 1,
-      difficulty: 'easy',
-      status: 'active',
-      missions: [
-        {
-          type: 'attend_event',
-          title: 'Asistir a 1 evento',
-          description: 'Marca asistencia en un evento del club.',
-          unit: 'events',
-          validationType: 'automatic',
-          target: 1,
-          requiresApproval: false,
-          order: 1,
-        },
-        {
-          type: 'upload_event_photo',
-          title: 'Subir 1 foto del evento',
-          description: 'Sube una foto del local/evento en NightVibe.',
-          unit: 'photos',
-          validationType: 'automatic',
-          target: 1,
-          params: { perEvent: true },
-          requiresApproval: false,
-          order: 2,
-        },
-      ],
-      reward: { type: 'shot', title: '1 chupito', value: 1 },
-    },
+    level(1, 'Primera noche', 'easy', 'Ven a tu primer evento y sube una foto de la noche.', [
+      { type: 'attend_event', title: 'Marca asistencia a un evento', description: 'Marca que vas a un evento del club.', target: 1, unit: 'events', validationType: 'automatic', requiresApproval: false },
+      photo({
+        type: 'upload_event_photo',
+        title: 'Sube una foto del evento',
+        description: 'Sube una foto de la noche desde dentro del local.',
+        target: 1,
+        params: { perEvent: true },
+        photoCriteria: 'Una foto tomada dentro del local durante el evento, donde se vea el ambiente de la noche.',
+      }),
+    ], { type: 'shot', title: '1 chupito de bienvenida', value: 1 }),
 
-    {
-      scope: 'global',
-      levelNumber: 2,
-      title: 'Nivel 2 — Social starter',
-      description: 'Completa acciones sociales y demuestra asistencia con fotos.',
-      order: 2,
-      difficulty: 'medium',
-      status: 'active',
-      missions: [
-        {
-          type: 'follow_users',
-          title: 'Seguir a 5 usuarios',
-          description: 'Sigue a 5 cuentas dentro de NightVibe.',
-          unit: 'users',
-          validationType: 'automatic',
-          target: 5,
-          requiresApproval: false,
-          order: 1,
-        },
-        {
-          type: 'attend_event',
-          title: 'Asistir a 2 eventos',
-          description: 'Asiste a 2 eventos (del club o de la plataforma, según configuración).',
-          unit: 'events',
-          validationType: 'automatic',
-          target: 2,
-          requiresApproval: false,
-          order: 2,
-        },
-        {
-          type: 'upload_event_photo',
-          title: 'Subir una foto en cada evento',
-          description: 'Sube una foto en cada evento al que asistas.',
-          unit: 'photos',
-          validationType: 'automatic',
-          target: 2,
-          params: { perEvent: true },
-          requiresApproval: false,
-          order: 3,
-        },
-        {
-          type: 'group_photo_with_followed',
-          title: 'Foto de grupo con los usuarios seguidos',
-          description: 'Sube una foto de grupo con los 5 usuarios que has seguido.',
-          unit: 'photos',
-          validationType: 'manual',
-          target: 1,
-          requiresApproval: true,
-          order: 4,
-        },
-      ],
-      reward: { type: 'free_entry', title: 'Entrada gratis (1 persona)', value: 1 },
-    },
+    level(2, 'Repites', 'easy', 'Vuelve: escanea el QR del local en 2 eventos distintos.', [
+      { type: 'scan_qr', title: 'Escanea el QR en 2 eventos distintos', description: 'Escanea el QR del local en dos eventos diferentes.', target: 2, unit: 'scans', validationType: 'automatic', requiresApproval: false },
+    ], { type: 'custom', title: 'Sin cola una noche', value: 1 }),
 
-    {
-      scope: 'global',
-      levelNumber: 3,
-      title: 'Nivel 3 — Búsqueda del QR',
-      description: 'Encuentra el QR en la discoteca y completa la dinámica del sello.',
-      order: 3,
-      difficulty: 'medium',
-      status: 'active',
-      missions: [
-        {
-          type: 'scan_qr',
-          title: 'Encontrar y escanear el QR del local',
-          description: 'Escanea el QR dentro de la discoteca.',
-          unit: 'scans',
-          validationType: 'automatic',
-          target: 1,
-          requiresApproval: false,
-          order: 1,
-        },
-        {
-          type: 'stamps_competition',
-          title: 'Conseguir sellos y subir foto',
-          description: 'Sube una foto con el sello en la cara. Quien consiga más sellos en el evento sube de nivel.',
-          unit: 'competitions',
-          validationType: 'manual',
-          target: 1,
-          requiresApproval: true,
-          order: 2,
-        },
-      ],
-      reward: { type: 'custom', title: 'Subida de nivel + premio del club', description: 'El club decide el premio exacto.' },
-    },
+    level(3, 'Con gente', 'medium', 'Sal con tu gente y hazte una foto de grupo.', [
+      photo({
+        type: 'group_photo_with_followed',
+        title: 'Foto de grupo',
+        description: 'Sube una foto de grupo dentro del local.',
+        target: 1,
+        photoCriteria: 'Una foto donde aparezcan al menos tres personas juntas dentro del local.',
+      }),
+      { type: 'follow_users', title: 'Sigue a 3 personas', description: 'Sigue a 3 cuentas en NightVibe.', target: 3, unit: 'users', validationType: 'automatic', requiresApproval: false },
+    ], { type: 'shot', title: 'Chupito para ti y un amigo', value: 2 }),
 
-    {
-      scope: 'global',
-      levelNumber: 4,
-      title: 'Nivel 4 — Temática',
-      description: 'Participa en un evento temático y sube la foto.',
-      missions: [
-        {
-          type: 'theme_photo',
-          title: 'Foto con temática con 1 persona',
-          description: 'Sube una foto vestido/a de la temática con 1 amigo/a o pareja.',
-          target: 1,
-          requiresApproval: true,
-          order: 1,
-        },
-      ],
-      reward: { type: 'shot', title: '2 chupitos (1 cada uno)', value: 2 },
-    },
+    level(4, 'Corre la voz', 'medium', 'Comparte un evento y consigue que alguien abra tu enlace.', [
+      { type: 'share_event', title: 'Comparte un evento', description: 'Comparte un evento del club con tu enlace.', target: 1, unit: 'shares', validationType: 'link_tracking', requiresApproval: false },
+      { type: 'link_clicks', title: 'Consigue 1 clic en tu enlace', description: 'Que alguien abra el enlace que has compartido.', target: 1, unit: 'clicks', validationType: 'link_tracking', requiresApproval: false },
+    ], { type: 'free_entry', title: 'Entrada gratis a un evento', value: 1 }),
 
-    {
-      scope: 'global',
-      levelNumber: 5,
-      title: 'Nivel 5 — Photocall',
-      description: 'Foto en el photocall “modo pareja” (vale también con amigos).',
-      missions: [
-        {
-          type: 'photocall_photo',
-          title: 'Foto en el photocall',
-          description: 'Sube una foto en el photocall con 1 persona.',
-          target: 1,
-          requiresApproval: true,
-          order: 1,
-        },
-      ],
-      reward: { type: 'free_entry', title: 'Entrada gratis para 2', value: 2 },
-    },
+    level(5, 'Habitual', 'medium', 'Ya eres de la casa: escanea el QR en 4 eventos.', [
+      { type: 'scan_qr', title: 'Escanea el QR en 4 eventos distintos', description: 'Escanea el QR del local en cuatro eventos diferentes.', target: 4, unit: 'scans', validationType: 'automatic', requiresApproval: false },
+    ], { type: 'drink', title: 'Copa gratis', value: 1 }),
 
-    {
-      scope: 'global',
-      levelNumber: 6,
-      title: 'Nivel 6 — Coleccionista',
-      description: 'Demuestra tus premios obtenidos en NightVibe.',
-      missions: [
-        {
-          type: 'show_prizes_photo',
-          title: 'Foto con tus premios obtenidos',
-          description: 'Sube una foto mostrando premios o evidencias obtenidas en eventos.',
-          target: 1,
-          requiresApproval: true,
-          order: 1,
-        },
-      ],
-      reward: { type: 'custom', title: 'Premio del club', description: 'Consumición / upgrade / regalo, según el club.' },
-    },
+    level(6, 'La foto buena', 'hard', 'Ven con la temática del evento y demuéstralo.', [
+      photo({
+        type: 'theme_photo',
+        title: 'Foto con la temática',
+        description: 'Sube una foto vestido/a según la temática del evento.',
+        target: 1,
+        photoCriteria: 'Una foto de al menos dos personas vestidas o caracterizadas según la temática del evento, dentro del local.',
+      }),
+    ], { type: 'custom', title: 'Sin cola + chupito', value: 1 }),
 
-    {
-      scope: 'global',
-      levelNumber: 7,
-      title: 'Nivel 7 — Team outfit',
-      description: 'Evento temático, con outfit/disfraz, y foto con 1 persona.',
-      missions: [
-        {
-          type: 'theme_photo',
-          title: 'Foto temática con 1 persona',
-          description: 'Asiste a un evento temático y sube una foto con 1 amigo/a o pareja.',
-          target: 1,
-          requiresApproval: true,
-          order: 1,
-        },
-      ],
-      reward: { type: 'drink', title: '1 consumición gratuita', value: 1 },
-    },
+    level(7, 'Traes gente', 'hard', 'Que 2 personas compren entrada con tu enlace.', [
+      { type: 'referred_purchases', title: '2 compras con tu enlace', description: 'Dos personas compran entrada desde tu enlace.', target: 2, unit: 'purchases', validationType: 'link_tracking', requiresApproval: false },
+    ], { type: 'custom', title: 'Entrada gratis + copa', value: 1 }),
 
-    {
-      scope: 'global',
-      levelNumber: 8,
-      title: 'Nivel 8 — Veterano',
-      description: 'Constancia en la plataforma.',
-      missions: [
-        {
-          type: 'attend_event',
-          title: 'Asistir a 20 eventos',
-          description: 'Alcanza 20 eventos asistidos en NightVibe.',
-          target: 20,
-          params: { platformWide: true },
-          requiresApproval: false,
-          order: 1,
-        },
-      ],
-      reward: { type: 'vip_access', title: 'Acceso VIP para 4', value: 4, meta: { people: 4 } },
-    },
+    level(8, 'Fiel', 'hard', 'Constancia: escanea el QR en 7 eventos.', [
+      { type: 'scan_qr', title: 'Escanea el QR en 7 eventos distintos', description: 'Escanea el QR del local en siete eventos diferentes.', target: 7, unit: 'scans', validationType: 'automatic', requiresApproval: false },
+    ], { type: 'bottle', title: 'Botella de cava para tu mesa', value: 1 }),
 
-    {
-      scope: 'global',
-      levelNumber: 9,
-      title: 'Nivel 9 — Leyenda',
-      description: 'Nivel alto de actividad en NightVibe.',
-      missions: [
-        {
-          type: 'attend_event',
-          title: 'Asistir a 40 eventos',
-          description: 'Alcanza 40 eventos asistidos en NightVibe.',
-          target: 40,
-          params: { platformWide: true },
-          requiresApproval: false,
-          order: 1,
-        },
-      ],
-      reward: { type: 'bottle', title: '1 botella a elegir en VIP', value: 1 },
-    },
+    level(9, 'El último empujón', 'extreme', 'Dos fotos más y llegas al final.', [
+      photo({
+        type: 'photocall_photo',
+        title: 'Foto en el photocall',
+        description: 'Sube una foto en el photocall del local con alguien.',
+        target: 1,
+        photoCriteria: 'Una foto de al menos dos personas posando delante del photocall del local.',
+      }),
+      photo({
+        type: 'show_prizes_photo',
+        title: 'Foto con tus premios',
+        description: 'Sube una foto enseñando los premios que has conseguido.',
+        target: 1,
+        photoCriteria: 'Una foto donde se vean claramente premios o recompensas conseguidas en el club: pulseras, consumiciones, entradas o similares.',
+      }),
+    ], { type: 'custom', title: 'Copa gratis + sin cola el resto de la temporada', value: 1 }),
 
-    {
-      scope: 'global',
-      levelNumber: 10,
-      title: 'Nivel 10 — Top tier',
-      description: 'El nivel máximo: constancia total.',
-      missions: [
-        {
-          type: 'attend_event',
-          title: 'Asistir a 50 eventos',
-          description: 'Alcanza 50 eventos asistidos en NightVibe.',
-          target: 50,
-          params: { platformWide: true },
-          requiresApproval: false,
-          order: 1,
-        },
-      ],
-      reward: { type: 'trip', title: 'Viaje a Nueva York (1 semana)', value: 1, meta: { destination: 'New York', durationDays: 7 } },
-    },
+    level(10, 'Ganador', 'extreme', 'Has llegado al final.', [], { type: 'bottle', title: 'Mesa con botella para ti y tus amigos', value: 1 }),
   ]);
 };
 

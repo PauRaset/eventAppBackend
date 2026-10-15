@@ -5,8 +5,17 @@ const crypto = require('crypto');
 const { createHash } = require('crypto');
 
 const ShareLink = require('../models/ShareLink');
+const ShareOpen = require('../models/ShareOpen');
 const Event = require('../models/Event');
 const { anyAuth, ensureUserId } = require('../middlewares/authMiddleware');
+
+// Misiones de referidos (eventRoutes). Carga perezosa: evita depender del orden
+// en que index.js carga los routers.
+function referralSync() {
+  return require('./eventRoutes');
+}
+
+const REF_CODE_RE = /^[A-Za-z0-9_-]{1,64}$/;
 
 // Genera refCode corto (compatible con Node antiguos)
 function genRefCode() {
@@ -310,6 +319,11 @@ router.post('/create', anyAuth, ensureUserId, async (req, res) => {
         createdByUserId,
         channel: channel ? String(channel) : null,
       });
+
+      // Misión share_event (recalcula; no bloquea la respuesta)
+      referralSync()
+        .syncReferralForEvent({ userKey: createdByUserId, eventId: String(eventId) })
+        .catch((e) => console.warn('[share/create] referral sync:', e?.message || e));
     }
 
     const shareBase = pickShareBase(req);
@@ -327,6 +341,63 @@ router.post('/create', anyAuth, ensureUserId, async (req, res) => {
     return res.json({ ok: true, refCode: link.refCode, shareUrl, appUrl });
   } catch (e) {
     console.error('[share/create]', e);
+    return res.status(500).json({ ok: false, error: 'server_error' });
+  }
+});
+
+// POST /api/share/open   body: { refCode }
+// La app lo llama al abrirse desde un enlace compartido (?ref=) con el usuario
+// AUTENTICADO. Es el único "clic" que da progreso (link_clicks): una persona
+// distinta de quien compartió, una vez por enlace. Los clics web anónimos de
+// /r/:refCode siguen solo en la analítica.
+// -> { ok, eventId, counted, reason? }   reason: 'self' | 'already_counted'
+router.post('/open', anyAuth, ensureUserId, async (req, res) => {
+  try {
+    const refCode = typeof req.body?.refCode === 'string' ? req.body.refCode.trim() : '';
+    if (!REF_CODE_RE.test(refCode)) {
+      return res.status(400).json({ ok: false, error: 'invalid_ref' });
+    }
+
+    const link = await ShareLink.findOne({ refCode }).lean();
+    if (!link) return res.status(404).json({ ok: false, error: 'ref_not_found' });
+
+    const { resolveMongoUserId, syncReferralForEvent } = referralSync();
+    // Identidades traducidas a _id de Mongo (el middleware deja el uid de Firebase)
+    const openerUserId = await resolveMongoUserId(req.user?.id || req.firebaseUser?.uid);
+    const sharerUserId = await resolveMongoUserId(link.createdByUserId);
+    if (!openerUserId) return res.status(401).json({ ok: false, error: 'unauthorized' });
+
+    const eventId = String(link.eventId);
+    if (!sharerUserId) return res.json({ ok: true, eventId, counted: false, reason: 'sharer_unknown' });
+
+    // Autorreferencia: abrir tu propio enlace no cuenta
+    if (openerUserId === sharerUserId) {
+      return res.json({ ok: true, eventId, counted: false, reason: 'self' });
+    }
+
+    try {
+      await ShareOpen.create({
+        refCode,
+        shareLink: link._id,
+        eventId,
+        sharerUserId,
+        openerUserId,
+      });
+    } catch (e) {
+      if (e?.code === 11000) {
+        return res.json({ ok: true, eventId, counted: false, reason: 'already_counted' });
+      }
+      throw e;
+    }
+
+    // Misión link_clicks de quien compartió (recalcula; no bloquea la respuesta)
+    syncReferralForEvent({ userKey: sharerUserId, eventId }).catch((e) =>
+      console.warn('[share/open] referral sync:', e?.message || e)
+    );
+
+    return res.json({ ok: true, eventId, counted: true });
+  } catch (e) {
+    console.error('[share/open]', e);
     return res.status(500).json({ ok: false, error: 'server_error' });
   }
 });

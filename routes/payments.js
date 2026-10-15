@@ -794,6 +794,14 @@ router.post('/checkout', anyAuthMw, resolveAppUser, async (req, res) => {
     }
     const requestedTierId = typeof body.tierId === 'string' ? body.tierId.trim() : '';
 
+    // Referido (opcional): el refCode del enlace compartido desde el que llegó
+    // el usuario. Igual que en /direct: va a los metadatos de Stripe y el webhook
+    // lo resuelve a refUserId. Formato inválido -> se ignora (nunca bloquea la compra).
+    const refCodeRaw = typeof body.refCode === 'string' ? body.refCode.trim() : '';
+    const refCode = /^[A-Za-z0-9_-]{1,64}$/.test(refCodeRaw) ? refCodeRaw : '';
+    const shareChannelRaw = typeof body.shareChannel === 'string' ? body.shareChannel.trim() : '';
+    const shareChannel = refCode ? shareChannelRaw.slice(0, 64) : '';
+
     // 2) Evento
     const event = await Event.findById(eventId).lean();
     if (!event) return res.status(404).json({ error: 'event_not_found', message: 'Evento no encontrado' });
@@ -1012,6 +1020,8 @@ router.post('/checkout', anyAuthMw, resolveAppUser, async (req, res) => {
           ...tierMeta,
           perTicketFeeCents: String(PLATFORM_FEE_CENTS),
           feeLineAdded: feeLineItem ? '1' : '0',
+          ...(refCode ? { refCode } : {}),
+          ...(shareChannel ? { shareChannel } : {}),
         },
         allow_promotion_codes: true,
         expires_at: Math.floor(Date.now() / 1000) + 30 * 60,

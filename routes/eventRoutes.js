@@ -15,6 +15,8 @@ const Order = require("../models/Order"); // entradas: compra pagada = Order.sta
 const Ticket = require("../models/Ticket");
 const Club = require("../models/Club");
 const QrScan = require("../models/QrScan");
+const ShareLink = require("../models/ShareLink");
+const ShareOpen = require("../models/ShareOpen");
 const { isPhotoMission } = require("../utils/photoMissions");
 const { reviewPhoto, enqueuePhotoReview, getAutoApproveMin } = require("../utils/photoReview");
 const { makeToken } = require("../utils/ticketToken");
@@ -682,11 +684,18 @@ async function ensurePromotionProgressDoc({ userId, clubId }) {
   if (!templates.length) return null;
 
   const built = UserClubPromotionProgress.buildFromTemplates({ templates, startLevel: 1 });
-  progress = await UserClubPromotionProgress.create({
-    user: userId,
-    club: clubId,
-    ...built,
-  });
+  try {
+    progress = await UserClubPromotionProgress.create({
+      user: userId,
+      club: clubId,
+      ...built,
+    });
+  } catch (e) {
+    // Dos sincronizaciones a la vez para un usuario sin progreso: la otra ya lo
+    // creó (índice único user+club). Usamos el suyo en vez de fallar.
+    if (e?.code !== 11000) throw e;
+    progress = await UserClubPromotionProgress.findOne({ user: userId, club: clubId });
+  }
 
   return progress;
 }
@@ -851,11 +860,193 @@ function updateScanQrMissionsForLevel(level) {
  * en el primer escaneo de cada evento), para que reescanear el mismo QR no infle
  * el contador. Mismo patrón que syncPromotionAfterAttend.
  */
+/* ------------------------------------------------------------------
+   MISIONES DE REFERIDOS (share_event, link_clicks, referred_purchases)
+   Se RECALCULAN desde los datos (idempotente: llamarla de más no cuenta de
+   más, y los reembolsos se descuentan solos). Conteo ACUMULADO en el club:
+   cuenta todo lo hecho en ese club, también antes de llegar al nivel.
+------------------------------------------------------------------- */
+const REFERRAL_MISSION_TYPES = new Set(["share_event", "link_clicks", "referred_purchases"]);
+
+/** uid de Firebase o _id de Mongo -> _id de Mongo (string), o null. */
+async function resolveMongoUserId(key) {
+  const k = String(key || "").trim();
+  if (!k) return null;
+  if (/^[a-fA-F0-9]{24}$/.test(k)) {
+    const u = await User.findById(k).select("_id").lean();
+    if (u) return String(u._id);
+  }
+  const byUid = await User.findOne({ firebaseUid: k }).select("_id").lean();
+  return byUid ? String(byUid._id) : null;
+}
+
+/** Eventos del club, con la MISMA clave que el resto del progreso (no los clubId guardados). */
+async function eventIdsForClubKey(clubKey) {
+  const key = String(clubKey || "");
+  if (!key) return [];
+  const or = [{ clubId: key }];
+  if (/^[a-fA-F0-9]{24}$/.test(key)) or.push({ createdBy: key }, { club: key });
+  const events = await Event.find({ $or: or }).select("_id createdBy clubId club").lean();
+  return events.filter((e) => promotionClubKeyForEvent(e) === key).map((e) => String(e._id));
+}
+
+/** Recuentos acumulados del usuario en el club. */
+async function computeReferralCounts({ userId, clubKey }) {
+  const me = await User.findById(userId).select("_id firebaseUid email").lean();
+  if (!me) return null;
+  const myId = String(me._id);
+  const keys = [myId, me.firebaseUid].filter(Boolean).map(String); // ShareLink/Order guardan uno u otro
+  const myEmail = String(me.email || "").trim().toLowerCase();
+
+  const eventIds = await eventIdsForClubKey(clubKey);
+  if (!eventIds.length) return { share_event: 0, link_clicks: 0, referred_purchases: 0 };
+
+  const [sharedEvents, openers, orders] = await Promise.all([
+    // share_event: eventos DISTINTOS del club que ha compartido
+    ShareLink.distinct("eventId", { createdByUserId: { $in: keys }, eventId: { $in: eventIds } }),
+    // link_clicks: personas DISTINTAS (autenticadas, no él) que abrieron sus enlaces
+    ShareOpen.distinct("openerUserId", { sharerUserId: myId, eventId: { $in: eventIds } }),
+    // referred_purchases: órdenes PAGADAS (no reembolsadas) con su enlace
+    Order.find({ refUserId: { $in: keys }, status: "paid", eventId: { $in: eventIds } })
+      .select("userId email")
+      .lean(),
+  ]);
+
+  // Compradores DISTINTOS: por _id de Mongo (traduciendo uid) o, sin cuenta, por email.
+  const uidsToMap = [...new Set(orders.map((o) => String(o.userId || "")).filter((v) => v && !/^[a-fA-F0-9]{24}$/.test(v)))];
+  const uidMap = new Map();
+  if (uidsToMap.length) {
+    const users = await User.find({ firebaseUid: { $in: uidsToMap } }).select("_id firebaseUid").lean();
+    for (const u of users) uidMap.set(String(u.firebaseUid), String(u._id));
+  }
+  const buyers = new Set();
+  for (const o of orders) {
+    const uid = String(o.userId || "");
+    const buyerId = /^[a-fA-F0-9]{24}$/.test(uid) ? uid : uidMap.get(uid) || null;
+    const email = String(o.email || "").trim().toLowerCase();
+    if (buyerId && (buyerId === myId || keys.includes(uid))) continue; // autorreferencia
+    if (!buyerId && email && myEmail && email === myEmail) continue;   // autorreferencia (sin cuenta)
+    const buyerKey = buyerId ? `u:${buyerId}` : email ? `e:${email}` : null;
+    if (buyerKey) buyers.add(buyerKey);
+  }
+
+  return {
+    share_event: sharedEvents.length,
+    link_clicks: openers.filter((o) => String(o) !== myId).length,
+    referred_purchases: buyers.size,
+  };
+}
+
+/**
+ * Aplica los recuentos a las misiones de referidos de un nivel.
+ * Una misión ya COMPLETADA no se toca: un reembolso posterior no deshace un
+ * nivel superado. En las no completadas, current baja si el recuento baja.
+ * En niveles bloqueados se actualiza current (acumulado) pero no el estado.
+ */
+function applyReferralCountsToLevel(level, counts) {
+  for (const m of level.missions || []) {
+    if (!REFERRAL_MISSION_TYPES.has(m.type)) continue;
+    if (m.status === "completed") continue;
+
+    const target = Number(m.target || 1);
+    m.current = Math.min(Number(counts[m.type] || 0), target);
+    m.updatedAt = new Date();
+    if (level.status === "locked") continue;
+
+    if (m.current >= target) {
+      m.status = "completed";
+      m.completedAt = m.completedAt || new Date();
+    } else if (m.status !== "pending") {
+      m.status = "in_progress";
+      m.completedAt = null;
+    }
+  }
+}
+
+async function syncReferralMissions({ userId, clubKey }) {
+  if (!/^[a-fA-F0-9]{24}$/.test(String(userId || "")) || !clubKey) return;
+
+  // Si otra sincronización guarda el mismo progreso a la vez, Mongoose rechaza
+  // la nuestra (VersionError). Como se RECALCULA desde los datos, reintentar
+  // con el documento fresco es seguro: no puede contar de más.
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      await syncReferralMissionsOnce({ userId, clubKey });
+      return;
+    } catch (e) {
+      if (e?.name === "VersionError" && attempt < 3) continue;
+      console.warn("[promotions] syncReferralMissions failed:", e?.message || e);
+      return;
+    }
+  }
+}
+
+async function syncReferralMissionsOnce({ userId, clubKey }) {
+  {
+    const counts = await computeReferralCounts({ userId, clubKey });
+    if (!counts) return;
+
+    const progress = await ensurePromotionProgressDoc({ userId, clubId: clubKey });
+    if (!progress) return;
+
+    for (const lvl of progress.levels || []) {
+      applyReferralCountsToLevel(lvl, counts);
+      lvl.progress = computeLevelProgress(lvl);
+    }
+
+    // Completar niveles y, al desbloquear uno, aplicarle también el acumulado.
+    let guard = 0;
+    while (guard++ < 15) {
+      const cur = (progress.levels || []).find((l) => Number(l.levelNumber) === Number(progress.currentLevel));
+      if (!cur) break;
+
+      applyReferralCountsToLevel(cur, counts);
+      cur.progress = computeLevelProgress(cur);
+      if (cur.status !== "completed" && allMissionsCompleted(cur)) {
+        cur.status = "completed";
+        cur.completedAt = new Date();
+        unlockNextLevel(progress, cur.levelNumber);
+        continue;
+      }
+      break;
+    }
+
+    refreshCurrentSnapshot(progress);
+    progress.lastActivityAt = new Date();
+    progress.markModified("levels");
+    await progress.save(); // VersionError -> lo reintenta syncReferralMissions
+  }
+}
+
+/**
+ * Atajo para share.js, el webhook de Stripe y promociones: recibe la identidad
+ * como venga guardada (uid o _id) y el evento, y resuelve usuario y club.
+ */
+async function syncReferralForEvent({ userKey, eventId }) {
+  try {
+    const userId = await resolveMongoUserId(userKey);
+    if (!userId || !mongoose.isValidObjectId(String(eventId || ""))) return;
+    const event = await Event.findById(eventId).select("_id createdBy clubId club").lean();
+    const clubKey = promotionClubKeyForEvent(event);
+    if (clubKey) await syncReferralMissions({ userId, clubKey });
+  } catch (e) {
+    console.warn("[promotions] syncReferralForEvent failed:", e?.message || e);
+  }
+}
+
+/** Si otra sincronización ha cambiado de nivel, el nivel nuevo recibe el acumulado de referidos. */
+async function syncReferralIfLevelChanged({ userId, clubId, previousLevel, progress }) {
+  if (progress && Number(progress.currentLevel) !== Number(previousLevel)) {
+    await syncReferralMissions({ userId: String(userId), clubKey: String(clubId) });
+  }
+}
+
 async function syncPromotionAfterQrScan({ userId, clubId, eventId }) {
   try {
     const progress = await ensurePromotionProgressDoc({ userId, clubId });
     if (!progress) return;
 
+    const previousLevel = progress.currentLevel; // para el acumulado de referidos
     progress.counters = progress.counters || {};
     progress.counters.qrScansInClub = clampNonNegative((progress.counters.qrScansInClub || 0) + 1);
 
@@ -883,6 +1074,7 @@ async function syncPromotionAfterQrScan({ userId, clubId, eventId }) {
     progress.lastEventId = eventId || progress.lastEventId;
     progress.lastActivityAt = new Date();
     await progress.save();
+    await syncReferralIfLevelChanged({ userId, clubId, previousLevel, progress });
   } catch (e) {
     console.warn("[promotions] syncPromotionAfterQrScan failed:", e?.message || e);
   }
@@ -918,6 +1110,7 @@ async function syncPromotionAfterAttend({ userId, clubId, eventId, attendedNow }
     const progress = await ensurePromotionProgressDoc({ userId, clubId });
     if (!progress) return;
 
+    const previousLevel = progress.currentLevel; // para el acumulado de referidos
     progress.counters = progress.counters || {};
     const delta = attendedNow ? 1 : -1;
 
@@ -948,6 +1141,7 @@ async function syncPromotionAfterAttend({ userId, clubId, eventId, attendedNow }
     progress.lastEventId = eventId || progress.lastEventId;
     progress.lastActivityAt = new Date();
     await progress.save();
+    await syncReferralIfLevelChanged({ userId, clubId, previousLevel, progress });
   } catch (e) {
     console.warn("[promotions] syncPromotionAfterAttend failed:", e?.message || e);
   }
@@ -982,6 +1176,7 @@ async function syncPromotionAfterPhotoApproved({
       return false;
     }
 
+    const previousLevel = progress.currentLevel; // para el acumulado de referidos
     progress.counters = progress.counters || {};
     progress.counters.photosUploadedInClub = clampNonNegative((progress.counters.photosUploadedInClub || 0) + 1);
 
@@ -1029,6 +1224,7 @@ async function syncPromotionAfterPhotoApproved({
     progress.lastEventId = eventId || progress.lastEventId;
     progress.lastActivityAt = new Date();
     await progress.save();
+    await syncReferralIfLevelChanged({ userId, clubId, previousLevel, progress });
     return matchedMission;
   } catch (e) {
     console.warn("[promotions] syncPromotionAfterPhotoApproved failed:", e?.message || e);
@@ -4117,3 +4313,7 @@ router.post("/:id/image", anyAuth, ensureUserId, upload.single("image"), async (
 module.exports = router;
 // Enlace público del acompañante: index.js lo monta en /api/tickets
 module.exports.ticketClaimRouter = ticketClaimRouter;
+// Misiones de referidos: las usan routes/share.js, el webhook de Stripe y promociones
+module.exports.syncReferralForEvent = syncReferralForEvent;
+module.exports.syncReferralMissions = syncReferralMissions;
+module.exports.resolveMongoUserId = resolveMongoUserId;
