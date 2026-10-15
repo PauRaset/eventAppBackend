@@ -57,6 +57,10 @@ const eventPhotoSchema = new mongoose.Schema(
     // Si es 'ai', reviewedBy queda a null (no hay usuario detrás).
     reviewSource: { type: String, enum: ["club", "ai", null], default: null },
 
+    // true cuando esta foto YA sumó a su misión. Una foto suma como mucho UNA vez:
+    // rechazarla después no lo resta ni lo desmarca, y volver a aprobarla no suma.
+    missionCounted: { type: Boolean, default: false },
+
     // moderation result metadata saved by the club when approving/rejecting the photo
     validatedForMissionType: { type: String, default: null },
     validatedForMissionId: { type: String, default: null },

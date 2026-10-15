@@ -968,11 +968,19 @@ async function syncPromotionAfterPhotoApproved({
   missionTitle = null,
   levelNumber = null,
 }) {
+  // Devuelve true solo si de verdad avanzó una misión (y se guardó).
   try {
-    if (!missionKey) return;
+    if (!missionKey) return false;
 
     const progress = await ensurePromotionProgressDoc({ userId, clubId });
-    if (!progress) return;
+    if (!progress) {
+      console.warn("[promotions] syncPromotionAfterPhotoApproved: sin progreso (¿no hay plantillas globales?)", {
+        userId: String(userId || ""),
+        clubId: String(clubId || ""),
+        missionKey,
+      });
+      return false;
+    }
 
     progress.counters = progress.counters || {};
     progress.counters.photosUploadedInClub = clampNonNegative((progress.counters.photosUploadedInClub || 0) + 1);
@@ -1021,8 +1029,10 @@ async function syncPromotionAfterPhotoApproved({
     progress.lastEventId = eventId || progress.lastEventId;
     progress.lastActivityAt = new Date();
     await progress.save();
+    return matchedMission;
   } catch (e) {
     console.warn("[promotions] syncPromotionAfterPhotoApproved failed:", e?.message || e);
+    return false;
   }
 }
 
@@ -1043,26 +1053,45 @@ const uploadAny = multer({ storage });
 /**
  * Efectos de APROBAR una foto, iguales la apruebe el club o la IA:
  *  - avisar a los asistentes de que hay foto nueva,
- *  - avanzar la misión de la foto (solo si countForMission: no en re-aprobaciones).
+ *  - avanzar la misión de la foto UNA SOLA VEZ en toda su vida (photo.missionCounted).
  * `req` solo se usa para construir URLs absolutas (en segundo plano: pseudo-req).
  */
-async function applyPhotoApprovalEffects({ req, event, photo, countForMission }) {
+async function applyPhotoApprovalEffects({ req, event, photo }) {
   await createNewEventPhotoNotifications({ req, event, photo });
 
-  // Promotions: solo cuenta cuando está aprobada, una sola vez, y SOLO para la
-  // misión que lleva la foto (sin missionId = foto del muro: no avanza nada).
+  // Promotions: SOLO para la misión que lleva la foto (sin missionId = foto del
+  // muro: no avanza nada).
   const clubId = event.createdBy ? String(event.createdBy._id || event.createdBy) : null;
   const uploaderId = photo.by ? String(photo.by) : null;
-  if (clubId && uploaderId && countForMission) {
-    await syncPromotionAfterPhotoApproved({
-      userId: uploaderId,
-      clubId,
-      eventId: String(event._id),
-      missionType: photo.validatedForMissionType || photo.missionType || null,
-      missionKey: photo.validatedForMissionId || photo.missionId || null,
-      missionTitle: photo.validatedForMissionTitle || photo.missionTitle || null,
-      levelNumber: photo.validatedForLevelNumber ?? photo.levelNumber ?? null,
-    });
+  const missionKey = photo.validatedForMissionId || photo.missionId || null;
+  if (!clubId || !uploaderId || !missionKey || !photo.photoId) return;
+
+  // Contar UNA vez por foto: comprobar y marcar en una sola escritura atómica.
+  // Si dos aprobaciones llegan a la vez, solo una gana la marca y suma.
+  // Rechazar después NO desmarca: aprobar, rechazar y aprobar no vuelve a sumar.
+  const claim = await Event.updateOne(
+    { _id: event._id, photos: { $elemMatch: { photoId: photo.photoId, missionCounted: { $ne: true } } } },
+    { $set: { "photos.$.missionCounted": true } }
+  );
+  if ((claim.n ?? claim.matchedCount) !== 1) return; // ya contó antes
+
+  const counted = await syncPromotionAfterPhotoApproved({
+    userId: uploaderId,
+    clubId,
+    eventId: String(event._id),
+    missionType: photo.validatedForMissionType || photo.missionType || null,
+    missionKey,
+    missionTitle: photo.validatedForMissionTitle || photo.missionTitle || null,
+    levelNumber: photo.validatedForLevelNumber ?? photo.levelNumber ?? null,
+  });
+
+  if (!counted) {
+    // No llegó a sumar (sin progreso, misión no encontrada o error): se quita la
+    // marca para que una aprobación posterior pueda contarla cuando sí sea posible.
+    await Event.updateOne(
+      { _id: event._id, "photos.photoId": photo.photoId },
+      { $set: { "photos.$.missionCounted": false } }
+    );
   }
 }
 
@@ -1195,7 +1224,6 @@ async function runPhotoReview({ eventId, photoId, imagePath, isMissionPhoto, pho
             req: pseudoReqFromBase(publicBase),
             event,
             photo,
-            countForMission: true,
           });
         }
         console.log("[photoReview] foto de misión APROBADA automáticamente", {
@@ -3311,8 +3339,6 @@ router.post("/:id/photos/:photoId/approve", anyAuth, ensureUserId, async (req, r
 
     const note = (req.body?.reviewNote || "").toString();
     const validationMeta = extractPhotoValidationMeta(req.body || {});
-    // Re-aprobar una foto ya aprobada no debe volver a sumar a la misión
-    const wasApproved = event.photos[idx].status === "approved";
 
     event.photos[idx].status = "approved";
     event.photos[idx].reviewedBy = req.user.id;
@@ -3328,11 +3354,11 @@ router.post("/:id/photos/:photoId/approve", anyAuth, ensureUserId, async (req, r
     await event.save();
 
     // Mismo camino que la aprobación automática de la IA (runPhotoReview).
+    // El avance de la misión se cuenta una sola vez por foto (photo.missionCounted).
     await applyPhotoApprovalEffects({
       req,
       event,
       photo: event.photos[idx],
-      countForMission: !wasApproved,
     });
 
     return res.json({
