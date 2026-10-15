@@ -41,6 +41,38 @@ const toCents = (n) => {
   return Math.round(parsed * 100);
 };
 
+// Imagen del producto en Stripe Checkout. Nunca lanza: si el valor no es una
+// ruta/URL utilizable devuelve null y el checkout sigue sin imagen.
+// event.photos guarda objetos { url, status, ... } (strings solo en datos legacy).
+const buildAbsoluteImageUrl = (req, value) => {
+  let raw = value;
+  if (raw && typeof raw === 'object') {
+    if (raw.status && raw.status !== 'approved') return null; // nunca fotos sin moderar
+    raw = raw.url;
+  }
+  if (typeof raw !== 'string') return null;
+  const path = raw.trim();
+  if (!path) return null;
+  if (/^https?:\/\//i.test(path)) return path;
+  const base = process.env.PUBLIC_UPLOADS_BASE_URL || `${req.protocol}://${req.get('host')}`;
+  return `${base}${path.startsWith('/') ? path : `/${path}`}`;
+};
+
+const resolveEventImageUrl = (req, event) => {
+  try {
+    const fromImage = buildAbsoluteImageUrl(req, event && event.image);
+    if (fromImage) return fromImage;
+    const photos = event && Array.isArray(event.photos) ? event.photos : [];
+    for (const p of photos) {
+      const url = buildAbsoluteImageUrl(req, p);
+      if (url) return url;
+    }
+  } catch (e) {
+    console.warn('[checkout] imagen del evento ignorada:', e && e.message);
+  }
+  return null;
+};
+
 // Selección de tema/plantilla para Email + PDF de entradas (se consume en el webhook)
 // Nota: esto NO cambia el flujo de pago; solo añade metadata para que el webhook
 // pueda decidir qué estética/plantilla aplicar.
@@ -528,43 +560,8 @@ router.get('/direct/:eventId', async (req, res) => {
   
       // ==== Cartel / imagen del evento para Stripe Checkout ====
       // ==== Cartel / imagen del evento para Stripe Checkout ====
-      let eventImageUrl = null;
-
-      // Función auxiliar para montar una URL absoluta desde una ruta relativa
-      const buildAbsoluteImageUrl = (relativePath) => {
-        if (!relativePath) return null;
-
-        // si ya es absoluta, la devolvemos tal cual
-        if (/^https?:\/\//.test(relativePath)) return relativePath;
-
-        // nos aseguramos de que empieza por '/'
-        let cleanPath = relativePath;
-        if (!cleanPath.startsWith('/')) {
-          cleanPath = '/' + cleanPath;
-        }
-
-        // base URL: env o dominio actual del backend
-        const base =
-          process.env.PUBLIC_UPLOADS_BASE_URL ||
-          `${req.protocol}://${req.get('host')}`;
-
-        return `${base}${cleanPath}`;
-      };
-
-      // 1) Intentamos con event.image
-      if (event.image) {
-        eventImageUrl = buildAbsoluteImageUrl(event.image);
-      }
-
-      // 2) Si no hay, probamos con la primera foto de event.photos
-      if (
-        !eventImageUrl &&
-        Array.isArray(event.photos) &&
-        event.photos.length > 0 &&
-        event.photos[0]
-      ) {
-        eventImageUrl = buildAbsoluteImageUrl(event.photos[0]);
-      }
+      // event.image y, si no hay, la primera foto aprobada; null si nada sirve
+      const eventImageUrl = resolveEventImageUrl(req, event);
   
       // Descripción opcional para Stripe
       const descriptionParts = [];
@@ -952,17 +949,7 @@ router.post('/checkout', anyAuthMw, resolveAppUser, async (req, res) => {
     }
 
     // Imagen y descripción: igual que /direct
-    const buildAbsoluteImageUrl = (relativePath) => {
-      if (!relativePath) return null;
-      if (/^https?:\/\//.test(relativePath)) return relativePath;
-      const cleanPath = relativePath.startsWith('/') ? relativePath : `/${relativePath}`;
-      const base = process.env.PUBLIC_UPLOADS_BASE_URL || `${req.protocol}://${req.get('host')}`;
-      return `${base}${cleanPath}`;
-    };
-    let eventImageUrl = event.image ? buildAbsoluteImageUrl(event.image) : null;
-    if (!eventImageUrl && Array.isArray(event.photos) && event.photos.length > 0 && event.photos[0]) {
-      eventImageUrl = buildAbsoluteImageUrl(event.photos[0]);
-    }
+    const eventImageUrl = resolveEventImageUrl(req, event);
 
     const descriptionParts = [];
     if (event.city) descriptionParts.push(event.city);
