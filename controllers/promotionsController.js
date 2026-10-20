@@ -8,6 +8,12 @@ const Notification = require('../models/Notification');
 const { sendPushNotificationToUser } = require('../utils/sendPushNotification');
 const { getTemplatesForClub: getTemplatesForClubShared } = require('../utils/promotionTemplates');
 const {
+  normalizeRewardType,
+  autoRewardTitle,
+  validateReward,
+  rewardTypeOptions,
+} = require('../utils/rewardTypes');
+const {
   isPhotoMission,
   PHOTO_CRITERIA_MIN_LENGTH,
   PHOTO_CRITERIA_MAX_LENGTH,
@@ -341,27 +347,44 @@ function findInvalidPhotoCriteria(levels) {
   return null;
 }
 
+/**
+ * Premio normalizado (la coherencia la comprueba validateReward):
+ *  - tipos antiguos (vip_access, trip) -> custom
+ *  - value: número; vacío -> 1 en los tipos cerrados, null en custom; un texto
+ *    que no es número queda NaN para que la validación lo rechace
+ *  - sin título en un tipo cerrado -> se autogenera ("2 chupitos", "Copa gratis")
+ */
 function normalizeRewardInput(reward = {}) {
+  const type = normalizeRewardType(reward?.type);
   const rawValue = reward?.value;
 
-  let numericValue = null;
-  if (typeof rawValue === 'number' && Number.isFinite(rawValue)) {
-    numericValue = rawValue;
-  } else if (
-    typeof rawValue === 'string' &&
-    rawValue.trim() !== '' &&
-    !Number.isNaN(Number(rawValue))
-  ) {
-    numericValue = Number(rawValue);
+  let value = null;
+  if (typeof rawValue === 'number') {
+    value = rawValue;
+  } else if (typeof rawValue === 'string' && rawValue.trim() !== '') {
+    value = Number(rawValue.trim().replace(',', '.'));
   }
+  if (value === null && type !== 'custom') value = 1;
+
+  let title = String(reward?.title || '').trim();
+  if (!title && type !== 'custom') title = autoRewardTitle(type, value) || '';
 
   return {
-    type: String(reward.type || 'custom').trim() || 'custom',
-    title: String(reward.title || '').trim(),
-    description: String(reward.description || '').trim(),
-    value: numericValue,
-    active: typeof reward.active === 'boolean' ? reward.active : true,
+    type,
+    title,
+    description: String(reward?.description || '').trim(),
+    value,
+    active: typeof reward?.active === 'boolean' ? reward.active : true,
   };
+}
+
+/** Primer premio incoherente de una lista de niveles normalizados, o null. */
+function findInvalidReward(levels) {
+  for (const level of levels) {
+    const problem = validateReward(level.reward);
+    if (problem) return { ...problem, levelNumber: level.levelNumber };
+  }
+  return null;
 }
 
 function normalizeLevelInput(level = {}, idx = 0) {
@@ -1816,6 +1839,8 @@ exports.getClubPromotionConfig = async (req, res) => {
       ok: true,
       clubId,
       levels: templates.map(serializeLevelDoc).sort((a, b) => a.order - b.order),
+      // Tipos de premio para el selector del portal: [{ type, label }]
+      rewardTypes: rewardTypeOptions(),
     });
   } catch (e) {
     console.error('[promotions] getClubPromotionConfig error:', e);
@@ -1909,6 +1934,131 @@ async function replaceClubTemplates(clubId, docs) {
   }
 }
 
+/**
+ * PUT /api/promotions/clubs/:clubId/levels/:levelNumber
+ * Guarda UN nivel del club sin tocar los demás:
+ *  - valida solo ese nivel (título, premio, criterio de las fotos, esquema);
+ *    un problema en otro nivel no le afecta,
+ *  - reemplaza solo ese documento (sin deleteMany/insertMany del club),
+ *  - conserva las claves de misión (assignMissionKeys).
+ * Lo que no venga en el cuerpo se queda como estaba (p. ej. sin `missions`
+ * se mantienen las misiones; el premio se mezcla con el actual).
+ * Cuerpo: el nivel, directamente o en { level: {...} }.
+ */
+exports.upsertClubLevel = async (req, res) => {
+  try {
+    const { clubId } = req.params;
+    if (!isValidObjectId(clubId)) {
+      return res.status(400).json({ ok: false, error: 'Invalid clubId' });
+    }
+    const levelNumber = Number(req.params.levelNumber);
+    if (!Number.isInteger(levelNumber) || levelNumber < 1 || levelNumber > 100) {
+      return res.status(400).json({ ok: false, error: 'invalid_level_number', message: 'El número de nivel debe estar entre 1 y 100' });
+    }
+
+    if (!(await canManageClub(req, clubId))) {
+      return res.status(403).json({ ok: false, error: 'Forbidden' });
+    }
+
+    const body = req.body && typeof req.body.level === 'object' && req.body.level ? req.body.level : req.body || {};
+    if (typeof body !== 'object' || Array.isArray(body)) {
+      return res.status(400).json({ ok: false, error: 'invalid_body' });
+    }
+    if (body.levelNumber !== undefined && Number(body.levelNumber) !== levelNumber) {
+      return res.status(400).json({
+        ok: false,
+        error: 'level_number_mismatch',
+        message: 'El número de nivel del cuerpo no coincide con el de la ruta',
+      });
+    }
+
+    // Si el club aún usa las globales, se le crean sus copias (como la ruta de todos)
+    await ensureClubTemplates(clubId);
+    const existing = await PromotionLevelTemplate.findOne({ scope: 'club', club: clubId, levelNumber });
+    const prev = existing ? existing.toObject() : null;
+
+    // Lo que no venga se queda como estaba
+    const merged = {
+      ...(prev
+        ? {
+            title: prev.title,
+            description: prev.description,
+            difficulty: prev.difficulty,
+            order: prev.order,
+            status: prev.status,
+            active: prev.active,
+            visibleInApp: prev.visibleInApp,
+            version: prev.version,
+            missions: prev.missions,
+          }
+        : {}),
+      ...body,
+      levelNumber,
+      reward: { ...(prev?.reward || {}), ...(body.reward && typeof body.reward === 'object' ? body.reward : {}) },
+    };
+    // status y active van juntos: si solo llega uno, el otro se deduce de él
+    if (body.status !== undefined && body.active === undefined) delete merged.active;
+    if (body.active !== undefined && body.status === undefined) delete merged.status;
+    // Tipo de premio cambiado sin título nuevo: que se autogenere del tipo
+    // nuevo (si no, un "1 chupito" pasado a copa seguiría diciendo chupito).
+    if (body.reward && body.reward.type && prev?.reward && body.reward.type !== prev.reward.type && body.reward.title === undefined) {
+      delete merged.reward.title;
+    }
+
+    // ---- Validar SOLO este nivel ----
+    if (!String(merged.title || '').trim()) {
+      return res.status(400).json({ ok: false, error: 'level_title_required', levelNumber, message: 'El nivel necesita un título' });
+    }
+    const doc = { scope: 'club', club: clubId, ...normalizeLevelInput(merged, levelNumber - 1) };
+    const invalid = findInvalidPhotoCriteria([doc]) || findInvalidReward([doc]);
+    if (invalid) {
+      return res.status(400).json({ ok: false, ...invalid });
+    }
+    const problems = await validateLevelDocs([doc]);
+    if (problems.length) {
+      return res.status(400).json({ ok: false, error: 'invalid_levels', problems });
+    }
+
+    // Claves de misión estables (por _id, nivel + tipo + orden, o tipo)
+    PromotionLevelTemplate.assignMissionKeys([doc], prev ? [prev] : []);
+
+    // ---- Guardar SOLO este documento ----
+    let saved;
+    try {
+      if (existing) {
+        existing.set(doc);
+        saved = await existing.save();
+      } else {
+        saved = await new PromotionLevelTemplate(doc).save();
+      }
+    } catch (saveErr) {
+      if (saveErr?.name === 'VersionError' || isDuplicateKeyError(saveErr)) {
+        return res.status(409).json({
+          ok: false,
+          error: 'conflict',
+          message: 'Este nivel se ha guardado a la vez desde otro sitio. Recarga y vuelve a intentarlo.',
+        });
+      }
+      console.error('[promotions] upsertClubLevel: no se guardó:', saveErr?.message || saveErr);
+      return res.status(500).json({
+        ok: false,
+        error: 'save_failed',
+        message: 'No se ha guardado el nivel. Los demás niveles no se han tocado.',
+      });
+    }
+
+    return res.json({
+      ok: true,
+      clubId,
+      level: serializeLevelDoc(saved),
+      rewardTypes: rewardTypeOptions(),
+    });
+  } catch (e) {
+    console.error('[promotions] upsertClubLevel error:', e);
+    return res.status(500).json({ ok: false, error: 'Server error' });
+  }
+};
+
 exports.upsertClubLevelOverrides = async (req, res) => {
   try {
     const { clubId } = req.params;
@@ -1937,7 +2087,7 @@ exports.upsertClubLevelOverrides = async (req, res) => {
     }));
 
     // ---- Validar TODO antes de tocar la BD: si falla, 400 y nada cambia ----
-    const invalid = findInvalidPhotoCriteria(docsToInsert);
+    const invalid = findInvalidPhotoCriteria(docsToInsert) || findInvalidReward(docsToInsert);
     if (invalid) {
       return res.status(400).json({ ok: false, ...invalid });
     }
@@ -1977,6 +2127,7 @@ exports.upsertClubLevelOverrides = async (req, res) => {
       ok: true,
       clubId,
       levels: saved.map(serializeLevelDoc).sort((a, b) => a.order - b.order),
+      rewardTypes: rewardTypeOptions(),
     });
   } catch (e) {
     console.error('[promotions] upsertClubLevelOverrides error:', e);

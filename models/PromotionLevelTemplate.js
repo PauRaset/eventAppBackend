@@ -40,15 +40,8 @@ const MISSION_TYPES = [
 /**
  * Tipos de recompensa (extensible)
  */
-const REWARD_TYPES = [
-  'shot',            // chupito
-  'drink',           // consumición
-  'free_entry',      // entrada gratis
-  'vip_access',      // acceso vip
-  'bottle',          // botella
-  'trip',            // viaje/premio grande
-  'custom',          // texto libre
-];
+// Tipos de premio (lista cerrada + 'custom'): utils/rewardTypes.js
+const { REWARD_TYPES } = require('../utils/rewardTypes');
 
 const LEVEL_STATUS = ['draft', 'active', 'paused'];
 const LEVEL_DIFFICULTY = ['easy', 'medium', 'hard', 'extreme'];
@@ -112,8 +105,11 @@ const RewardSchema = new Schema(
     // Detalles opcionales (ej: condiciones)
     description: { type: String, default: '' },
 
-    // Valor numérico opcional (ej: 1 chupito -> 1, VIP x4 -> 4)
+    // Cantidad (ej: 1 chupito -> 1, 2 copas -> 2). Obligatoria salvo en custom.
     value: { type: Number, default: null },
+
+    // Premio activo (el portal puede desactivarlo sin borrar el nivel)
+    active: { type: Boolean, default: true },
 
     // Datos extra (ej: { vipPeople: 4 }, { bottleOptions: [...] })
     meta: { type: Schema.Types.Mixed, default: {} },
@@ -315,14 +311,15 @@ PromotionLevelTemplateSchema.pre('save', function (next) {
 });
 
 /**
- * Plantillas por defecto: catálogo de 10 niveles (versión 2, octubre 2026).
+ * Plantillas por defecto: catálogo de 10 niveles (versión 3, octubre 2026).
  * Las usan scripts/seedPromotionTemplates.js (plantillas globales) y
  * ensureClubTemplates cuando no hay globales. Cada nivel N lleva al N+1.
  * Todas las misiones de foto llevan photoCriteria (lo usa la IA) y la misma
- * exclusión. `version: 2` para que el seed actualice las globales existentes
+ * exclusión. `version` (CATALOG_VERSION) para que el seed actualice las globales existentes
  * (solo sobrescribe si la versión entrante es mayor, o con --force).
  */
-const CATALOG_VERSION = 2;
+// v3: el premio del nivel 2 pasa a tipo skip_line (antes custom).
+const CATALOG_VERSION = 3;
 const PHOTO_EXCLUDE = 'Capturas de pantalla, fotos de otra pantalla o imágenes descargadas de internet.';
 
 PromotionLevelTemplateSchema.statics.getDefaultTemplates = function () {
@@ -364,7 +361,7 @@ PromotionLevelTemplateSchema.statics.getDefaultTemplates = function () {
 
     level(2, 'Repites', 'easy', 'Vuelve: escanea el QR del local en 2 eventos distintos.', [
       { type: 'scan_qr', title: 'Escanea el QR en 2 eventos distintos', description: 'Escanea el QR del local en dos eventos diferentes.', target: 2, unit: 'scans', validationType: 'automatic', requiresApproval: false },
-    ], { type: 'custom', title: 'Sin cola una noche', value: 1 }),
+    ], { type: 'skip_line', title: 'Sin cola una noche', value: 1 }),
 
     level(3, 'Con gente', 'medium', 'Sal con tu gente y hazte una foto de grupo.', [
       photo({

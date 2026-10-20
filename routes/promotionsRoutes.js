@@ -52,6 +52,11 @@ router.get('/clubs/:clubId/levels', anyAuthWithId, promotionsController.getClubP
 
 // Guardar niveles/premios/misiones del club
 // PUT /api/promotions/clubs/:clubId/levels
+// Lo usan el reordenado y el borrado de niveles (reemplaza todos)
 router.put('/clubs/:clubId/levels', anyAuthWithId, promotionsController.upsertClubLevelOverrides);
+
+// Guardar UN nivel sin tocar los demás (edición habitual)
+// PUT /api/promotions/clubs/:clubId/levels/:levelNumber
+router.put('/clubs/:clubId/levels/:levelNumber', anyAuthWithId, promotionsController.upsertClubLevel);
 
 module.exports = router;
