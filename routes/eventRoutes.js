@@ -26,6 +26,24 @@ const Notification = require("../models/Notification");
 const { sendPushNotificationToUser } = require("../utils/sendPushNotification");
 const { geocodeAddress, applyGeo, buildAddress } = require("../utils/geocode");
 const { sanitizeTiers, validateTierChanges, syncEventPrice } = require("../utils/tiers");
+const { accessInfo, validateAccessType, deriveAccessType } = require("../utils/accessType");
+
+/**
+ * accessType a guardar al crear/editar un evento, con precio y tandas FINALES.
+ *  - Si el cliente lo manda: tiene que ser válido y coherente (si no, 400).
+ *  - Si no lo manda (portal sin el campo todavía): se conserva el actual si
+ *    sigue siendo coherente; si no, se deduce del precio (paid / free_open).
+ * Devuelve { accessType } o { problem: { error, message } }.
+ */
+function resolveAccessTypeForSave(requested, finalState, currentType = null) {
+  if (requested !== undefined && requested !== null && String(requested).trim() !== "") {
+    const t = String(requested).trim();
+    const problem = validateAccessType(t, finalState);
+    return problem ? { problem } : { accessType: t };
+  }
+  if (currentType && !validateAccessType(currentType, finalState)) return { accessType: currentType };
+  return { accessType: deriveAccessType(finalState) };
+}
 
 /** ticketTiers puede llegar como array (JSON) o como string (FormData). */
 function parseTiersInput(raw) {
@@ -1628,15 +1646,24 @@ router.post("/", anyAuth, ensureUserId, upload.single("image"), async (req, res)
       return res.status(400).json({ message: tiersInput.error });
     }
     if (Array.isArray(tiersInput.value) && tiersInput.value.length > 0) {
-      const { tiers, error } = sanitizeTiers(tiersInput.value);
-      if (error) return res.status(400).json({ message: error });
+      const { tiers, error, errorCode } = sanitizeTiers(tiersInput.value);
+      if (error) return res.status(400).json({ ...(errorCode ? { error: errorCode } : {}), message: error });
       newEvent.ticketTiers = tiers;
       syncEventPrice(newEvent);
     }
 
+    // Tipo de acceso (gratis libre / gratis con aforo / de pago)
+    const access = resolveAccessTypeForSave(req.body.accessType, {
+      price: newEvent.price,
+      ticketTiers: newEvent.ticketTiers,
+    });
+    if (access.problem) return res.status(400).json(access.problem);
+    newEvent.accessType = access.accessType;
+
     const savedEvent = await newEvent.save();
     res.status(201).json({
       ...savedEvent.toObject(),
+      ...accessInfo(savedEvent),
       qrPayload: `NV_EVENT:${savedEvent._id}:${savedEvent.qrToken}`,
     });
   } catch (error) {
@@ -1684,6 +1711,7 @@ router.get("/mine", anyAuth, ensureUserId, async (req, res) => {
       return {
         ...event,
         imageUrl: absUrlFromUpload(req, event.image),
+        ...accessInfo(event), // accessType + requiresTicket (la app no interpreta precios)
         photos,
         createdBy: event.createdBy
           ? {
@@ -1723,6 +1751,7 @@ router.get("/", optionalUserId, async (req, res) => {
       return {
         ...event,
         imageUrl: absUrlFromUpload(req, event.image),
+        ...accessInfo(event), // accessType + requiresTicket (la app no interpreta precios)
         photos,
         createdBy: event.createdBy
           ? {
@@ -1788,6 +1817,7 @@ router.get("/search", optionalUserId, async (req, res) => {
       return {
         ...event,
         imageUrl: absUrlFromUpload(req, event.image),
+        ...accessInfo(event), // accessType + requiresTicket (la app no interpreta precios)
         photos,
         createdBy: event.createdBy
           ? {
@@ -1859,6 +1889,8 @@ router.get("/map", optionalUserId, async (req, res) => {
       categories: 1,
       clubId: 1,
       attendees: 1, // solo para contar, no se devuelve
+      accessType: 1,
+      "ticketTiers.priceEUR": 1, // solo para el tipo de acceso de eventos sin migrar
     };
 
     const events = await Event.find(filter, projection).lean();
@@ -1880,6 +1912,7 @@ router.get("/map", optionalUserId, async (req, res) => {
         : parseCategoriesMaybe(e.categories),
       clubId: e.clubId,
       attendeesCount: Array.isArray(e.attendees) ? e.attendees.length : 0,
+      ...accessInfo(e),
     }));
 
     return res.json(result);
@@ -2835,7 +2868,7 @@ router.get("/:id/tiers", optionalUserId, async (req, res) => {
 
     const event = await Event.findById(id)
       .select(
-        "_id price capacity ticketsSold ticketsReserved ticketTiers currency platformFeeEUR"
+        "_id price capacity ticketsSold ticketsReserved ticketTiers currency platformFeeEUR accessType"
       )
       .lean();
 
@@ -2911,6 +2944,7 @@ router.get("/:id/tiers", optionalUserId, async (req, res) => {
 
     return res.json({
       eventId:       String(event._id),
+      ...accessInfo(event),
       hasTiers,
       tiers,
       currency:      event.currency || "eur",
@@ -3089,6 +3123,7 @@ router.get("/:id", optionalUserId, async (req, res) => {
     const formattedEvent = {
       ...obj,
       imageUrl: absUrlFromUpload(req, obj.image),
+      ...accessInfo(obj), // accessType + requiresTicket (la app no interpreta precios)
       photos: approvedOnly(obj.photos).map((p) => toPhotoTileAbs(req, p, req.user?.id || null)).filter(Boolean),
       createdBy: obj.createdBy
         ? {
@@ -4166,8 +4201,8 @@ async function updateEventHandler(req, res) {
         typeof t.toObject === "function" ? t.toObject() : t
       );
 
-      const { tiers, error } = sanitizeTiers(tiersInput.value, existingTiers);
-      if (error) return res.status(400).json({ message: error });
+      const { tiers, error, errorCode } = sanitizeTiers(tiersInput.value, existingTiers);
+      if (error) return res.status(400).json({ ...(errorCode ? { error: errorCode } : {}), message: error });
 
       const check = validateTierChanges(tiers, existingTiers);
       if (!check.ok) return res.status(400).json({ message: check.error });
@@ -4187,6 +4222,20 @@ async function updateEventHandler(req, res) {
       }
     }
 
+    // Tipo de acceso, con el precio y las tandas como quedarán tras guardar.
+    // (findOneAndUpdate no pasa los validadores del esquema: se valida aquí.)
+    delete update.accessType;
+    const access = resolveAccessTypeForSave(
+      req.body.accessType,
+      {
+        price: update.price !== undefined ? update.price : event.price,
+        ticketTiers: update.ticketTiers !== undefined ? update.ticketTiers : event.ticketTiers,
+      },
+      event.accessType
+    );
+    if (access.problem) return res.status(400).json(access.problem);
+    update.accessType = access.accessType;
+
     // 4) Actualizar y devolver formateado
     const updated = await Event.findOneAndUpdate(updateFilter, update, { new: true })
       .populate("createdBy", "username email profilePicture displayName")
@@ -4201,6 +4250,7 @@ async function updateEventHandler(req, res) {
     const formatted = {
       ...updated,
       imageUrl: absUrlFromUpload(req, updated.image),
+      ...accessInfo(updated), // accessType + requiresTicket (la app no interpreta precios)
       photos: approvedOnly(updated.photos).map((p) => toPhotoTileAbs(req, p, req.user?.id || null)).filter(Boolean),
       createdBy: updated.createdBy
         ? {

@@ -218,6 +218,17 @@ const eventSchema = new mongoose.Schema(
     salesEnd:   { type: Date, default: null },
     isPublished: { type: Boolean, default: true },
 
+    // Cómo se accede al evento. Lo decide el club al crearlo.
+    //   free_open     entrada libre: no hace falta entrada, basta marcar asistencia
+    //   free_limited  gratis pero con aforo: hace falta entrada para reservar plaza
+    //   paid          de pago
+    // Coherencia con precio/tandas y lectura segura: utils/accessType.js
+    accessType: {
+      type: String,
+      enum: ['free_open', 'free_limited', 'paid'],
+      default: 'free_open',
+    },
+
     // Tipos de entrada y tandas. Si está vacío, el evento usa price/capacity
     // como siempre (comportamiento legacy).
     ticketTiers: { type: [ticketTierSchema], default: [] },

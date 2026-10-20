@@ -6,6 +6,25 @@ const Event = require('../models/Event');
 const Club = require('../models/Club');
 const User = require('../models/User');
 const { reserveStock, releaseStock, sweepExpiredReservations } = require('../utils/stock');
+const { accessTypeOf } = require('../utils/accessType');
+
+// Respuesta para eventos gratuitos en las rutas de compra (Stripe no admite 0 €).
+//  free_limited: las entradas gratis se emitirán sin Stripe (próxima entrega) -> 501
+//  free_open:    no hace falta entrada, basta marcar asistencia -> 400
+const FREE_ACCESS_ERRORS = {
+  free_limited: {
+    status: 501,
+    error: 'free_tickets_not_implemented',
+    title: 'Reserva de entradas gratuitas',
+    message: 'Las entradas gratuitas de este evento todavía no se pueden reservar online.',
+  },
+  free_open: {
+    status: 400,
+    error: 'no_ticket_required',
+    title: 'Entrada libre',
+    message: 'Este evento es de entrada libre: no necesitas entrada. Marca que vas desde la app.',
+  },
+};
 
 const router = express.Router();
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
@@ -466,6 +485,14 @@ async function venueNameForEvent(event) {
  */
 function directPurchaseState(event) {
   const now = new Date();
+  // Gratuitos: sin compra (entrada libre, o reserva gratuita aún no disponible)
+  const access = accessTypeOf(event);
+  if (access === 'free_open') {
+    return { options: [], blocked: 'Entrada libre: no necesitas entrada. Marca que vas desde la app.', label: 'Entrada libre', maxQty: 0 };
+  }
+  if (access === 'free_limited') {
+    return { options: [], blocked: 'Evento gratuito con aforo limitado. Muy pronto podrás reservar tu entrada aquí.', label: 'Gratis · aforo limitado', maxQty: 0 };
+  }
   if (event.salesStart && now < new Date(event.salesStart)) {
     return { options: [], blocked: `La venta empieza el ${formatEventDate(event.salesStart)}`, maxQty: 0 };
   }
@@ -529,7 +556,7 @@ async function renderDirectLanding(req, res) {
   const minPrice = state.options.length ? Math.min(...state.options.map((o) => o.price)) : null;
 
   const pageUrl = `${req.protocol}://${req.get('host')}${req.originalUrl}`;
-  const ogDescription = [when, venue || event.city, minPrice !== null ? `Desde ${formatEUR(minPrice)}` : state.blocked]
+  const ogDescription = [when, venue || event.city, minPrice !== null ? `Desde ${formatEUR(minPrice)}` : state.label || state.blocked]
     .filter(Boolean)
     .join(' · ');
 
@@ -673,6 +700,15 @@ async function startDirectCheckout(req, res) {
       }
       if (event.salesEnd && now > new Date(event.salesEnd)) {
         return sendInfoPage(res, 400, { title: 'La venta ha finalizado', event });
+      }
+
+      // Eventos gratuitos: no pasan por Stripe (antes, 400 de precio inválido)
+      const freeAccess = FREE_ACCESS_ERRORS[accessTypeOf(event)];
+      if (freeAccess) {
+        if (req.accepts(['html', 'json']) === 'json') {
+          return res.status(freeAccess.status).json({ error: freeAccess.error, message: freeAccess.message });
+        }
+        return sendInfoPage(res, freeAccess.status, { title: freeAccess.title, message: freeAccess.message, event });
       }
   
       // === Tandas: solo si el evento tiene ticketTiers activos ===
@@ -1168,6 +1204,12 @@ router.post('/checkout', anyAuthMw, resolveAppUser, checkoutLimiter, async (req,
     }
     if (event.salesEnd && now > new Date(event.salesEnd)) {
       return res.status(400).json({ error: 'sales_ended', message: 'La venta ya ha finalizado' });
+    }
+
+    // 3b) Eventos gratuitos: no pasan por Stripe (antes, 400 de precio inválido)
+    const freeAccess = FREE_ACCESS_ERRORS[accessTypeOf(event)];
+    if (freeAccess) {
+      return res.status(freeAccess.status).json({ error: freeAccess.error, message: freeAccess.message });
     }
 
     // 4) Club y cuenta de Stripe (igual que /direct)

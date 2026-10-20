@@ -42,7 +42,8 @@ function plain(t) {
  * - name obligatorio y no vacío; priceEUR >= 0; quantity entero >= 0.
  * - order: reasigna por posición en el array (1, 2, 3...).
  * - Normaliza salesStart/salesEnd a Date o null.
- * Devuelve { tiers, error } — error es un string legible o null.
+ * - No mezcla tandas gratis (0 €) y de pago: errorCode 'mixed_free_and_paid_tiers'.
+ * Devuelve { tiers, error, errorCode? } — error es un string legible o null.
  */
 function sanitizeTiers(incoming, existingTiers = []) {
   if (!Array.isArray(incoming)) {
@@ -116,6 +117,21 @@ function sanitizeTiers(incoming, existingTiers = []) {
       salesStart,
       salesEnd,
     });
+  }
+
+  // Tandas gratis y de pago en el mismo evento: prohibido. Con una tanda a 0 €,
+  // event.price pasaba a 0 (el evento entero parecía gratis) y la compra sin
+  // tanda elegida escogía la gratuita y fallaba. Para regalar entradas a
+  // alguien concreto está la asignación de entradas.
+  const freeTiers = tiers.filter((t) => t.priceEUR === 0);
+  if (freeTiers.length && tiers.some((t) => t.priceEUR > 0)) {
+    return {
+      tiers: [],
+      errorCode: 'mixed_free_and_paid_tiers',
+      error:
+        `No se pueden mezclar tandas gratis y de pago (${freeTiers.map((t) => `"${t.name}"`).join(', ')} a 0 €). ` +
+        'Para regalar entradas a alguien concreto, usa la asignación de entradas.',
+    };
   }
 
   return { tiers, error: null };
