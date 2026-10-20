@@ -163,7 +163,8 @@ UserClubPromotionProgressSchema.statics.buildFromTemplates = function ({
         .slice()
         .sort((a, b) => (a.order || 0) - (b.order || 0))
         .map((m) => {
-          const key = `L${t.levelNumber}_${m.type}_${(m.order || 0)}`; // estable y simple
+          // La clave de la plantilla (estable); la antigua solo si no tiene
+          const key = m.missionKey || `L${t.levelNumber}_${m.type}_${(m.order || 0)}`;
           return {
             missionKey: key,
             type: m.type,

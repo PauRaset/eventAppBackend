@@ -55,6 +55,11 @@ const LEVEL_DIFFICULTY = ['easy', 'medium', 'hard', 'extreme'];
 const VALIDATION_TYPES = ['automatic', 'manual', 'link_tracking', 'hybrid'];
 
 const MissionSchema = new Schema({
+  // Clave ESTABLE de la misión: la usan el progreso de cada usuario, las fotos
+  // (missionId) y las reclamaciones. Se genera una vez y se conserva al guardar
+  // niveles desde el portal (assignMissionKeys), aunque cambie el _id.
+  missionKey: { type: String, default: '' },
+
   // Tipo de misión (enum estable para backend/app)
   type: { type: String, enum: MISSION_TYPES, required: true },
 
@@ -178,6 +183,91 @@ PromotionLevelTemplateSchema.index(
   { unique: true }
 );
 
+/* ------------------------------------------------------------------
+   CLAVES DE MISIÓN
+------------------------------------------------------------------- */
+const MISSION_KEY_RE = /^[A-Za-z0-9_.:-]{1,100}$/;
+
+function isValidMissionKey(key) {
+  return MISSION_KEY_RE.test(String(key || ''));
+}
+
+/** Clave nueva para una misión creada desde el portal: única, legible. */
+function generateMissionKey(levelNumber, type) {
+  const rnd = new mongoose.Types.ObjectId().toString().slice(-8);
+  return `L${Number(levelNumber) || 0}_${String(type || 'mission')}_${rnd}`;
+}
+
+/**
+ * Pone missionKey a las misiones de `levels` CONSERVANDO las de `previousLevels`
+ * (los niveles que había guardados). Para cada misión, en este orden:
+ *   1) misma _id que una misión anterior          -> su clave
+ *   2) trae una clave que existía en ese nivel    -> la mantiene
+ *   3) mismo nivel + tipo + orden que una anterior -> su clave
+ *   4) mismo nivel + tipo (reordenada)            -> su clave
+ *   5) misión nueva                               -> clave nueva
+ * Nunca repite clave dentro de un nivel. Modifica `levels` y lo devuelve.
+ */
+function assignMissionKeys(levels, previousLevels = []) {
+  const prevById = new Map();
+  const prevByLevel = new Map(); // levelNumber -> [{ missionKey, type, order }]
+  for (const lvl of previousLevels || []) {
+    const n = Number(lvl.levelNumber);
+    for (const m of lvl.missions || []) {
+      if (!isValidMissionKey(m.missionKey)) continue;
+      if (m._id) prevById.set(String(m._id), m.missionKey);
+      if (!prevByLevel.has(n)) prevByLevel.set(n, []);
+      prevByLevel.get(n).push({ missionKey: m.missionKey, type: m.type, order: Number(m.order) });
+    }
+  }
+
+  for (const lvl of levels || []) {
+    const n = Number(lvl.levelNumber);
+    const prev = prevByLevel.get(n) || [];
+    const prevKeys = new Set(prev.map((p) => p.missionKey));
+    const used = new Set();
+    const take = (key) => (key && !used.has(key) ? (used.add(key), key) : null);
+
+    for (const m of lvl.missions || []) {
+      let key = null;
+      if (m._id && prevById.has(String(m._id))) key = take(prevById.get(String(m._id)));
+      if (!key && isValidMissionKey(m.missionKey) && prevKeys.has(m.missionKey)) key = take(m.missionKey);
+      if (!key) {
+        const same = prev.find((p) => p.type === m.type && p.order === Number(m.order) && !used.has(p.missionKey));
+        if (same) key = take(same.missionKey);
+      }
+      // Reordenada desde la lista del portal: misma misión del mismo tipo en el nivel
+      if (!key) {
+        const sameType = prev.find((p) => p.type === m.type && !used.has(p.missionKey));
+        if (sameType) key = take(sameType.missionKey);
+      }
+      // Clave traída de una copia (p. ej. plantillas del club copiadas de las globales)
+      if (!key && isValidMissionKey(m.missionKey)) key = take(m.missionKey);
+      if (!key) key = take(generateMissionKey(n, m.type));
+      m.missionKey = key;
+    }
+  }
+  return levels;
+}
+
+PromotionLevelTemplateSchema.statics.assignMissionKeys = assignMissionKeys;
+PromotionLevelTemplateSchema.statics.generateMissionKey = generateMissionKey;
+PromotionLevelTemplateSchema.statics.isValidMissionKey = isValidMissionKey;
+
+// Red de seguridad para CUALQUIER escritura con validación (save, insertMany):
+// ninguna misión se queda sin clave ni con una clave repetida en su nivel.
+PromotionLevelTemplateSchema.pre('validate', function (next) {
+  const used = new Set();
+  for (const m of this.missions || []) {
+    if (!m) continue;
+    if (!isValidMissionKey(m.missionKey) || used.has(m.missionKey)) {
+      m.missionKey = generateMissionKey(this.levelNumber, m.type);
+    }
+    used.add(m.missionKey);
+  }
+  next();
+});
+
 PromotionLevelTemplateSchema.pre('save', function (next) {
   if (typeof this.order !== 'number' || Number.isNaN(this.order)) {
     this.order = this.levelNumber;
@@ -245,7 +335,8 @@ PromotionLevelTemplateSchema.statics.getDefaultTemplates = function () {
     difficulty,
     status: 'active',
     version: CATALOG_VERSION,
-    missions: missions.map((m, idx) => ({ order: idx + 1, ...m })),
+    // Clave fija y legible para el catálogo: igual en cada siembra
+    missions: missions.map((m, idx) => ({ order: idx + 1, missionKey: `L${levelNumber}_${m.type}_${idx + 1}`, ...m })),
     reward,
   });
 

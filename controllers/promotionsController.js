@@ -292,6 +292,9 @@ function normalizeMissionInput(mission = {}, idx = 0) {
     // Solo un ObjectId real (24 hex). Ids del portal tipo "mission-1712345678"
     // hacían fallar insertMany con CastError DESPUÉS de borrar los niveles.
     ...(/^[a-fA-F0-9]{24}$/.test(String(mission._id || '')) ? { _id: mission._id } : {}),
+    // Clave estable si llega (copia de plantillas o el portal la devuelve); la
+    // decide assignMissionKeys al guardar, no el cliente.
+    ...(PromotionLevelTemplate.isValidMissionKey(mission.missionKey) ? { missionKey: String(mission.missionKey) } : {}),
     type,
     title,
     description,
@@ -406,6 +409,7 @@ function serializeLevelDoc(doc) {
             const m = mission && typeof mission.toObject === 'function' ? mission.toObject() : mission;
             return {
               id: m?._id?.toString?.() || null,
+              missionKey: m?.missionKey || null,
               type: m?.type || '',
               title: m?.title || '',
               description: m?.description || '',
@@ -589,8 +593,19 @@ function getTemplateMissionKey(mission, fallbackIndex = 0) {
   ).toString();
 }
 
-function syncMissionWithTemplate(existingMission, templateMission, missionIndex = 0) {
+function syncMissionWithTemplate(existingMission, templateMission, missionIndex = 0, { keepCompleted = false } = {}) {
   const missionKey = getTemplateMissionKey(templateMission, missionIndex);
+  const target = Number(templateMission.target || 1);
+  const current = Number(existingMission?.current || 0);
+
+  // Si el club ha SUBIDO el objetivo y el contador ya no llega, la misión deja
+  // de estar completada. No se toca en niveles cuyo premio ya se canjeó.
+  let status = existingMission?.status || 'in_progress';
+  let completedAt = existingMission?.completedAt || null;
+  if (!keepCompleted && (status === 'completed' || status === 'approved') && current < target) {
+    status = 'in_progress';
+    completedAt = null;
+  }
 
   return {
     missionKey,
@@ -610,38 +625,59 @@ function syncMissionWithTemplate(existingMission, templateMission, missionIndex 
     requiresApproval: !!templateMission.requiresApproval,
     order: Number(templateMission.order || missionIndex + 1),
     active: templateMission.active !== false,
-    status: existingMission?.status || 'in_progress',
-    current: Number(existingMission?.current || 0),
+    status,
+    current,
     claimId: existingMission?.claimId || null,
+    meta: existingMission?.meta || {},
     startedAt: existingMission?.startedAt || now(),
-    completedAt: existingMission?.completedAt || null,
+    completedAt,
     updatedAt: now(),
   };
 }
 
 function syncLevelWithTemplate(existingLevel, templateLevel, levelIndex = 0) {
   const existingMissions = Array.isArray(existingLevel?.missions) ? existingLevel.missions : [];
-  const missionsByKey = new Map(
-    existingMissions.map((mission, idx) => [getTemplateMissionKey(mission, idx), mission])
-  );
+  const templateMissions = Array.isArray(templateLevel.missions) ? templateLevel.missions : [];
+  const keepCompleted = existingLevel?.rewardRedeemed === true;
+
+  // Emparejar el progreso con la plantilla: 1) por CLAVE; 2) si no, con una
+  // misión del MISMO TIPO de este nivel que no se haya llevado otra; 3) si no,
+  // de cero. Nunca por posición: con plantillas distintas, una misión heredaba
+  // el contador y el estado de otra (p. ej. scan_qr "completada" con 1/3).
+  const templateKeys = templateMissions.map((m, i) => getTemplateMissionKey(m, i));
+  const byKey = new Map(existingMissions.map((m, i) => [getTemplateMissionKey(m, i), m]));
+  const taken = new Set();
+  const matched = templateKeys.map((key) => {
+    const m = byKey.get(key) || null;
+    if (m) taken.add(m);
+    return m;
+  });
+  templateMissions.forEach((tm, i) => {
+    if (matched[i]) return;
+    const sameType = existingMissions.find(
+      (m) => !taken.has(m) && String(m.type || '') === String(tm.type || '') &&
+        !templateKeys.includes(getTemplateMissionKey(m))
+    );
+    if (sameType) {
+      matched[i] = sameType;
+      taken.add(sameType);
+    }
+  });
 
   const nextLevelNumber = Number(templateLevel.levelNumber || levelIndex + 1);
-  const nextMissions = Array.isArray(templateLevel.missions)
-    ? templateLevel.missions
-        .map((mission, missionIndex) => {
-          const missionKey = getTemplateMissionKey(mission, missionIndex);
-          const existingMission =
-            missionsByKey.get(missionKey) ||
-            existingMissions[missionIndex] ||
-            null;
-          return syncMissionWithTemplate(existingMission, mission, missionIndex);
-        })
-        .sort((a, b) => a.order - b.order)
-    : [];
+  const nextMissions = templateMissions
+    .map((mission, missionIndex) =>
+      syncMissionWithTemplate(matched[missionIndex], mission, missionIndex, { keepCompleted })
+    )
+    .sort((a, b) => a.order - b.order);
 
   let nextStatus = existingLevel?.status || (nextLevelNumber === 1 ? 'in_progress' : 'locked');
   if (isLevelFullyCompleted({ status: nextStatus, missions: nextMissions })) {
     nextStatus = 'completed';
+  } else if (nextStatus === 'completed' && !keepCompleted) {
+    // Completado pero sin canjear, y una misión ha dejado de estar cumplida
+    // (objetivo subido o misión nueva): vuelve a estar en curso.
+    nextStatus = 'in_progress';
   }
 
   const syncedLevel = {
@@ -1062,6 +1098,34 @@ exports.syncPromotionAfterPhotoApproved = async function syncPromotionAfterPhoto
 // CONTROLLERS
 // ===========================
 
+/**
+ * Al ABRIR promociones en la app: recalcula las misiones acumuladas (scan_qr,
+ * attend_event, referidos) desde los datos, para que una misión acumulada que
+ * el club acaba de añadir muestre ya lo que el usuario tiene, en vez de 0 hasta
+ * su siguiente escaneo. Se llama DESPUÉS de guardar la sincronización con
+ * plantillas. Solo guarda si algo cambia y no cuenta como actividad (backfill).
+ * Devuelve el progreso a enseñar: el recargado si cambió, si no el mismo.
+ * Nunca rompe la respuesta: si falla, se enseña el progreso tal cual.
+ */
+async function withAccumulatedApplied(progress, userId, clubId) {
+  try {
+    const res = await require('../routes/eventRoutes').syncAccumulatedMissions({
+      userId: String(userId),
+      clubKey: String(clubId),
+      backfill: true,
+    });
+    if (!res || res.error || !res.changed) return progress;
+
+    const fresh = await UserClubPromotionProgress.findById(progress._id);
+    if (!fresh) return progress;
+    refreshCurrentSnapshot(fresh); // bloqueo por premio sin canjear, solo para la vista
+    return fresh;
+  } catch (e) {
+    console.warn('[promotions] recálculo del acumulado al abrir falló:', e?.message || e);
+    return progress;
+  }
+}
+
 exports.getMyPromotions = async (req, res) => {
   try {
     const { mongoUser } = await getAuthUser(req);
@@ -1085,7 +1149,8 @@ exports.getMyPromotions = async (req, res) => {
 
     const promotions = [];
 
-    for (const doc of docs) {
+    for (const original of docs) {
+      let doc = original;
       const clubId = doc.club?.toString?.();
       const clubDoc = clubId ? (clubsById[clubId] || null) : null;
 
@@ -1104,6 +1169,7 @@ exports.getMyPromotions = async (req, res) => {
       refreshCurrentSnapshot(doc);
       doc.lastActivityAt = now();
       await doc.save();
+      doc = await withAccumulatedApplied(doc, mongoUser._id, clubId);
     }
 
       promotions.push({
@@ -1197,7 +1263,7 @@ exports.getClubLevelsForUser = async (req, res) => {
       });
     }
 
-    const progress = await ensureProgressDoc({
+    let progress = await ensureProgressDoc({
       userId: mongoUser._id,
       clubId,
       templates,
@@ -1214,6 +1280,7 @@ exports.getClubLevelsForUser = async (req, res) => {
     refreshCurrentSnapshot(progress);
     progress.lastActivityAt = now();
     await progress.save();
+    progress = await withAccumulatedApplied(progress, mongoUser._id, clubId);
 
     return res.json({
       ok: true,
@@ -1879,7 +1946,16 @@ exports.upsertClubLevelOverrides = async (req, res) => {
       return res.status(400).json({ ok: false, error: 'invalid_levels', problems });
     }
 
-    await ensureClubTemplates(clubId);
+    const current = await ensureClubTemplates(clubId);
+
+    // Claves de misión ESTABLES: se conservan las que ya había (por _id o por
+    // nivel + tipo + orden) aunque el portal no mande el _id de las misiones.
+    // Sin esto, cada guardado cambiaba las claves y el progreso de los usuarios
+    // y sus fotos perdían el vínculo con la misión.
+    PromotionLevelTemplate.assignMissionKeys(
+      docsToInsert,
+      current.map((d) => (typeof d.toObject === 'function' ? d.toObject() : d))
+    );
 
     // Reemplazo completo de la configuración del club, sin poder dejarla vacía.
     try {

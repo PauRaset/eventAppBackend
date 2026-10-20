@@ -83,6 +83,10 @@ async function main() {
       continue;
     }
 
+    // updateOne no pasa por los hooks del modelo: las claves de misión se
+    // ponen aquí, conservando las del nivel ya sembrado si las tiene.
+    PromotionLevelTemplate.assignMissionKeys([t], existing ? [existing] : []);
+
     const updateDoc = {
       $set: {
         scope: 'global',
