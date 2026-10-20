@@ -59,6 +59,9 @@ const OrderSchema = new mongoose.Schema(
     reservedQty:       { type: Number,  default: 0 },
     reservationActive: { type: Boolean, default: false },
     expiresAt:         { type: Date,    default: null, index: true },
+    // IP de quien inició la compra web (/direct, sin login): tope de entradas
+    // reservadas a la vez por IP y evento.
+    clientIp:          { type: String,  default: null },
     // Marca de emisión de tickets, para idempotencia del webhook
     ticketsIssuedAt:   { type: Date,    default: null },
 
@@ -95,6 +98,9 @@ OrderSchema.virtual('grossCents').get(function () {
 /* ------------------- Índices compuestos ------------------ */
 OrderSchema.index({ clubId: 1, createdAt: -1 });
 OrderSchema.index({ eventId: 1, status: 1, createdAt: -1 });
+// Reservas activas de un comprador en un evento (topes de /direct y /checkout)
+OrderSchema.index({ eventId: 1, reservationActive: 1, clientIp: 1 });
+OrderSchema.index({ eventId: 1, reservationActive: 1, userId: 1 });
 OrderSchema.index({ clubId: 1, eventId: 1, status: 1, refUserId: 1, createdAt: -1 });
 
 module.exports = mongoose.model('Order', OrderSchema);

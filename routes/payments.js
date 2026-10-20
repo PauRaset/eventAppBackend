@@ -338,39 +338,341 @@ ${linkHtml}
 }
 
 
-  // GET /api/payments/direct/:eventId
-// Enlace estable que puedes compartir (no caduca).
-// Crea la sesión de Checkout y hace redirect 303 a Stripe.
-router.get('/direct/:eventId', async (req, res) => {
+/* ==================================================================
+   PROTECCIÓN DE RESERVAS (/direct y /checkout)
+   - GET /direct ya NO reserva: devuelve la página del evento (la que ven
+     las previsualizaciones de WhatsApp, iMessage...). Solo el POST que
+     envía el botón "Comprar" reserva y abre Stripe.
+   - Bots de previsualización: nunca pueden iniciar una compra.
+   - Límites de peticiones y tope de entradas reservadas a la vez.
+   La reserva dura 30 min: es el mínimo que Stripe admite para expires_at,
+   así que la reserva nunca caduca antes que la sesión que respalda.
+================================================================== */
+const rateLimit = require('express-rate-limit');
+
+const RESERVATION_MS = 30 * 60 * 1000;
+const MAX_QTY_DIRECT = 10;
+// Generosos a propósito: en la puerta del local mucha gente comparte la IP
+// (wifi del club, operadores móviles con IP compartida).
+const MAX_ACTIVE_RESERVED_PER_IP = Number(process.env.DIRECT_MAX_ACTIVE_PER_IP) || 30;
+const MAX_ACTIVE_RESERVED_PER_USER = Number(process.env.CHECKOUT_MAX_ACTIVE_PER_USER) || 20;
+
+// Previsualizadores de enlaces y rastreadores conocidos. iMessage se presenta
+// como "facebookexternalhit ... Twitterbot". Es una capa extra: lo que de
+// verdad protege es que el GET no reserve.
+const PREVIEW_BOT_RE =
+  /(whatsapp|facebookexternalhit|facebot|meta-externalagent|twitterbot|slackbot|slack-imgproxy|telegrambot|discordbot|linkedinbot|skypeuripreview|pinterest|redditbot|embedly|applebot|googlebot|google-inspectiontool|bingbot|yandex|baiduspider|duckduckbot|snapchat|viber|vkshare|line\/|kakaotalk|crawler|spider|headlesschrome)/i;
+
+function isPreviewBot(req) {
+  const ua = String(req.get('user-agent') || '').trim();
+  if (!ua) return true; // un navegador real siempre manda user-agent
+  return PREVIEW_BOT_RE.test(ua);
+}
+
+/** Entradas reservadas ahora mismo (sin pagar y sin caducar) que cumplen `match`. */
+async function activeReservedQty(match) {
+  const rows = await Order.aggregate([
+    { $match: { ...match, reservationActive: true, expiresAt: { $gt: new Date() } } },
+    { $group: { _id: null, n: { $sum: '$reservedQty' } } },
+  ]);
+  return rows[0]?.n || 0;
+}
+
+/* ---------- Páginas HTML (estética oscura NightVibe) ---------- */
+
+const NV_COLORS = { bg: '#0b0b10', card: '#15151d', line: '#26262f', text: '#f4f4f5', muted: '#a1a1aa', accent: '#a855f7' };
+
+function pageShell({ title, head = '', body }) {
+  return `<!doctype html>
+<html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${escapeHtml(title)}</title>
+<meta name="theme-color" content="${NV_COLORS.bg}">
+${head}
+<style>
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;background:${NV_COLORS.bg};color:${NV_COLORS.text};font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;-webkit-font-smoothing:antialiased}
+main{max-width:480px;margin:0 auto;padding:20px 16px 40px}
+.brand{font-weight:800;letter-spacing:.08em;font-size:13px;color:${NV_COLORS.accent};text-transform:uppercase;margin:4px 0 16px}
+.poster{width:100%;aspect-ratio:4/5;object-fit:cover;border-radius:18px;background:${NV_COLORS.card};display:block}
+h1{font-size:26px;line-height:1.2;margin:18px 0 8px}
+.meta{color:${NV_COLORS.muted};font-size:15px;line-height:1.5;margin:0}
+.card{background:${NV_COLORS.card};border:1px solid ${NV_COLORS.line};border-radius:16px;padding:16px;margin-top:18px}
+.tier{display:flex;align-items:center;gap:12px;padding:12px;border:1px solid ${NV_COLORS.line};border-radius:12px;margin-bottom:10px;cursor:pointer}
+.tier:has(input:checked){border-color:${NV_COLORS.accent};background:rgba(168,85,247,.08)}
+.tier input{accent-color:${NV_COLORS.accent};width:18px;height:18px;margin:0}
+.tier .name{flex:1;font-weight:600}
+.tier .left{display:block;font-weight:400;color:${NV_COLORS.muted};font-size:13px}
+.tier .price{font-weight:700}
+.row{display:flex;align-items:center;justify-content:space-between;gap:12px}
+select{background:${NV_COLORS.bg};color:${NV_COLORS.text};border:1px solid ${NV_COLORS.line};border-radius:10px;padding:10px 12px;font-size:16px}
+.price-big{font-size:22px;font-weight:800}
+.fee{color:${NV_COLORS.muted};font-size:13px;margin:10px 0 0}
+.total{margin-top:14px;padding-top:14px;border-top:1px solid ${NV_COLORS.line};font-weight:700}
+button,.btn{display:block;width:100%;margin-top:18px;padding:16px;border:0;border-radius:14px;background:${NV_COLORS.accent};color:#fff;font-size:17px;font-weight:700;text-align:center;text-decoration:none;cursor:pointer}
+button:disabled{background:${NV_COLORS.line};color:${NV_COLORS.muted};cursor:not-allowed}
+.notice{margin-top:18px;padding:14px;border-radius:12px;background:${NV_COLORS.card};border:1px solid ${NV_COLORS.line};color:${NV_COLORS.muted};text-align:center}
+.small{color:${NV_COLORS.muted};font-size:12px;text-align:center;margin-top:14px}
+</style></head>
+<body><main>${body}</main></body></html>`;
+}
+
+/** Página de aviso (errores, límites) con la misma estética. */
+function sendInfoPage(res, status, { title, message, event = null, eventId = null }) {
+  const id = eventId || (event ? String(event._id) : null);
+  const back = id
+    ? `<a class="btn" href="/api/payments/direct/${encodeURIComponent(id)}">Volver al evento</a>`
+    : '';
+  const body = `<div class="brand">NightVibe</div>
+<h1>${escapeHtml(title)}</h1>
+${event && event.title ? `<p class="meta">${escapeHtml(event.title)}</p>` : ''}
+${message ? `<p class="notice">${escapeHtml(message)}</p>` : ''}
+${back}`;
+  return res.status(status).type('html').send(pageShell({ title: `${title} · NightVibe`, body }));
+}
+
+function formatEventDate(d) {
+  if (!d) return '';
+  const date = new Date(d);
+  if (Number.isNaN(date.getTime())) return '';
+  try {
+    const s = new Intl.DateTimeFormat('es-ES', {
+      weekday: 'long', day: 'numeric', month: 'long', hour: '2-digit', minute: '2-digit', timeZone: 'Europe/Madrid',
+    }).format(date);
+    return s.charAt(0).toUpperCase() + s.slice(1);
+  } catch (_) {
+    return date.toISOString().slice(0, 16).replace('T', ' ');
+  }
+}
+
+/** Nombre del local para la página: Club vinculado o, si no, el usuario que lo creó. */
+async function venueNameForEvent(event) {
+  try {
+    if (event.club) {
+      const c = await Club.findById(event.club).select('name').lean();
+      if (c?.name) return c.name;
+    }
+    if (event.createdBy) {
+      const u = await User.findById(event.createdBy).select('displayName username').lean();
+      return u?.displayName || u?.username || '';
+    }
+  } catch (_) {}
+  return '';
+}
+
+/**
+ * Qué se puede comprar ahora en la página: tandas comprables (con precio > 0)
+ * o el precio único. Devuelve { options, blocked, maxQty }.
+ * blocked = texto si no se puede comprar (agotado, venta cerrada, gratis...).
+ */
+function directPurchaseState(event) {
+  const now = new Date();
+  if (event.salesStart && now < new Date(event.salesStart)) {
+    return { options: [], blocked: `La venta empieza el ${formatEventDate(event.salesStart)}`, maxQty: 0 };
+  }
+  if (event.salesEnd && now > new Date(event.salesEnd)) {
+    return { options: [], blocked: 'La venta ha finalizado', maxQty: 0 };
+  }
+
+  if (hasActiveTiers(event)) {
+    const all = availableTiers(event);
+    const options = all
+      .map((t) => {
+        const rem = tierRemaining(t);
+        return { tierId: t.tierId, name: t.name, price: parsePrice(t.priceEUR), remaining: rem === Infinity ? null : rem };
+      })
+      .filter((o) => o.price !== null && o.price > 0);
+    if (!all.length) return { options: [], blocked: 'Entradas agotadas', maxQty: 0 };
+    if (!options.length) return { options: [], blocked: 'Las entradas de este evento no se venden online', maxQty: 0 };
+    return { options, blocked: null, maxQty: MAX_QTY_DIRECT };
+  }
+
+  const rawPrice = event.price !== undefined && event.price !== null && event.price !== '' ? event.price : event.priceEUR;
+  const price = parsePrice(rawPrice);
+  if (price === null || !(price > 0)) {
+    return { options: [], blocked: 'Las entradas de este evento no se venden online', maxQty: 0 };
+  }
+  let remaining = null;
+  if (event.capacity > 0) {
+    remaining = Math.max(0, event.capacity - (event.ticketsSold || 0) - (event.ticketsReserved || 0));
+    if (remaining === 0) return { options: [], blocked: 'Entradas agotadas', maxQty: 0 };
+  }
+  return {
+    options: [{ tierId: null, name: 'Entrada', price, remaining }],
+    blocked: null,
+    maxQty: Math.min(MAX_QTY_DIRECT, remaining ?? MAX_QTY_DIRECT),
+  };
+}
+
+function platformFeeFor(event) {
+  const v = parsePrice(event.platformFeeEUR);
+  return v !== null ? Math.max(0, v) : 1.5;
+}
+
+/** GET /direct/:eventId — página del evento con Open Graph. NO reserva nada. */
+async function renderDirectLanding(req, res) {
+  const { eventId } = req.params;
+  if (!mongoose.isValidObjectId(eventId)) {
+    return sendInfoPage(res, 404, { title: 'Evento no encontrado' });
+  }
+  const event = await Event.findById(eventId).lean();
+  if (!event || event.isPublished === false) {
+    return sendInfoPage(res, 404, { title: 'Evento no encontrado', message: 'Este evento no existe o ya no está disponible.' });
+  }
+
+  const q = req.query || {};
+  const state = directPurchaseState(event);
+  const venue = await venueNameForEvent(event);
+  const address = [event.street, event.city].filter(Boolean).join(', ');
+  const when = formatEventDate(event.startAt || event.date);
+  const imageUrl = resolveEventImageUrl(req, event);
+  const fee = platformFeeFor(event);
+  const minPrice = state.options.length ? Math.min(...state.options.map((o) => o.price)) : null;
+
+  const pageUrl = `${req.protocol}://${req.get('host')}${req.originalUrl}`;
+  const ogDescription = [when, venue || event.city, minPrice !== null ? `Desde ${formatEUR(minPrice)}` : state.blocked]
+    .filter(Boolean)
+    .join(' · ');
+
+  const head = [
+    `<meta name="description" content="${escapeHtml(ogDescription)}">`,
+    `<meta property="og:type" content="website">`,
+    `<meta property="og:site_name" content="NightVibe">`,
+    `<meta property="og:locale" content="es_ES">`,
+    `<meta property="og:title" content="${escapeHtml(event.title || 'Evento NightVibe')}">`,
+    `<meta property="og:description" content="${escapeHtml(ogDescription)}">`,
+    `<meta property="og:url" content="${escapeHtml(pageUrl)}">`,
+    imageUrl ? `<meta property="og:image" content="${escapeHtml(imageUrl)}">` : '',
+    imageUrl ? `<meta property="og:image:alt" content="${escapeHtml(event.title || 'Cartel del evento')}">` : '',
+    `<meta name="twitter:card" content="${imageUrl ? 'summary_large_image' : 'summary'}">`,
+    `<meta name="twitter:title" content="${escapeHtml(event.title || 'Evento NightVibe')}">`,
+    `<meta name="twitter:description" content="${escapeHtml(ogDescription)}">`,
+    imageUrl ? `<meta name="twitter:image" content="${escapeHtml(imageUrl)}">` : '',
+  ].filter(Boolean).join('\n');
+
+  // Selección inicial: la tanda de ?tier= si es comprable; si no, la más barata.
+  const wantedTier = typeof q.tier === 'string' ? q.tier.trim() : '';
+  const cheapest = state.options.reduce((b, o) => (!b || o.price < b.price ? o : b), null);
+  const selected = state.options.find((o) => o.tierId && o.tierId === wantedTier) || cheapest;
+  let qty = Math.floor(Number(q.qty ?? q.q ?? 1));
+  if (!Number.isFinite(qty) || qty < 1) qty = 1;
+  if (state.maxQty) qty = Math.min(qty, state.maxQty);
+
+  const hidden = ['ref', 'ch']
+    .filter((k) => typeof q[k] === 'string' && q[k].trim())
+    .map((k) => `<input type="hidden" name="${k}" value="${escapeHtml(q[k].trim().slice(0, 64))}">`)
+    .join('');
+
+  let purchaseHtml;
+  if (state.blocked) {
+    purchaseHtml = `<p class="notice">${escapeHtml(state.blocked)}</p>`;
+  } else {
+    const isTiers = state.options.length > 1 || (state.options[0] && state.options[0].tierId);
+    const tiersHtml = isTiers
+      ? state.options.map((o) => `<label class="tier">
+<input type="radio" name="tier" value="${escapeHtml(o.tierId)}" data-price="${o.price}"${o === selected ? ' checked' : ''}>
+<span class="name">${escapeHtml(o.name)}${o.remaining !== null && o.remaining <= 20 ? `<span class="left">Quedan ${o.remaining}</span>` : ''}</span>
+<span class="price">${escapeHtml(formatEUR(o.price))}</span></label>`).join('')
+      : `<div class="row"><span>Entrada</span><span class="price-big">${escapeHtml(formatEUR(selected.price))}</span></div>`;
+    const qtyOptions = Array.from({ length: state.maxQty }, (_, i) => i + 1)
+      .map((n) => `<option value="${n}"${n === qty ? ' selected' : ''}>${n}</option>`)
+      .join('');
+    purchaseHtml = `<form method="post" action="${escapeHtml(req.baseUrl + req.path)}" class="card" id="buy" data-fee="${fee}" data-price="${selected.price}">
+${tiersHtml}
+<div class="row" style="margin-top:12px"><label for="qty">Cantidad</label><select id="qty" name="qty">${qtyOptions}</select></div>
+${fee > 0 ? `<p class="fee">+ ${escapeHtml(formatEUR(fee))} de gastos de gestión por entrada</p>` : ''}
+<div class="row total"><span>Total</span><span id="total"></span></div>
+${hidden}
+<button type="submit">Comprar entradas</button>
+<p class="small">Pago seguro con Stripe. Recibirás las entradas por email.</p>
+</form>
+<script>
+(function(){var f=document.getElementById('buy');if(!f)return;var t=document.getElementById('total');
+function eur(n){try{return new Intl.NumberFormat('es-ES',{style:'currency',currency:'EUR'}).format(n)}catch(e){return n.toFixed(2)+' €'}}
+function upd(){var r=f.querySelector('input[name=tier]:checked');var p=parseFloat(r?r.dataset.price:f.dataset.price)||0;
+var q=parseInt(f.qty.value,10)||1;t.textContent=eur(q*(p+(parseFloat(f.dataset.fee)||0)))}
+f.addEventListener('change',upd);upd();
+f.addEventListener('submit',function(){var b=f.querySelector('button');b.disabled=true;b.textContent='Abriendo el pago…'});})();
+</script>`;
+  }
+
+  const body = `<div class="brand">NightVibe</div>
+${imageUrl ? `<img class="poster" src="${escapeHtml(imageUrl)}" alt="${escapeHtml(event.title || 'Cartel del evento')}">` : ''}
+<h1>${escapeHtml(event.title || 'Evento')}</h1>
+${when ? `<p class="meta">${escapeHtml(when)}</p>` : ''}
+${venue ? `<p class="meta">${escapeHtml(venue)}</p>` : ''}
+${address ? `<p class="meta">${escapeHtml(address)}</p>` : ''}
+${purchaseHtml}`;
+
+  res.set('Cache-Control', 'no-store');
+  return res.status(200).type('html').send(pageShell({ title: `${event.title || 'Evento'} · NightVibe`, head, body }));
+}
+
+// Límites de peticiones (antes /api/payments/* no tenía ninguno)
+const directPageLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 60, // la página: solo contra rastreo masivo
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+const directStartLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  limit: 10, // compras iniciadas por IP cada 10 min
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (req, res) =>
+    sendInfoPage(res, 429, {
+      title: 'Demasiados intentos',
+      message: 'Has iniciado muchas compras seguidas. Espera unos minutos y vuelve a intentarlo.',
+      eventId: mongoose.isValidObjectId(req.params.eventId) ? req.params.eventId : null,
+    }),
+});
+
+
+// POST /api/payments/direct/:eventId  (botón "Comprar" de la página del GET)
+// Reserva, crea la orden y la sesión de Checkout y hace redirect 303 a Stripe.
+// Datos del formulario: qty, tier, ref, ch.
+async function startDirectCheckout(req, res) {
     try {
       const { eventId } = req.params;
+      const input = req.body && typeof req.body === 'object' ? req.body : {};
+
+      // Bots y clientes sin user-agent no pueden iniciar compras
+      if (isPreviewBot(req)) {
+        console.warn('[direct] compra rechazada: bot o sin user-agent', {
+          eventId, ip: req.ip, ua: String(req.get('user-agent') || '').slice(0, 200),
+        });
+        return sendInfoPage(res, 403, { title: 'No se puede iniciar la compra', eventId: mongoose.isValidObjectId(eventId) ? eventId : null });
+      }
+      if (!mongoose.isValidObjectId(eventId)) {
+        return sendInfoPage(res, 404, { title: 'Evento no encontrado' });
+      }
       sweepExpiredReservations().catch(() => {});   // no bloqueante
 
       // === Share tracking (optional, non-breaking) ===
       // You can append these params to the /direct link when sharing:
       //   /api/payments/direct/:eventId?ref=XXXX&ch=ig_story
       // They will be persisted in Stripe session metadata so the webhook can attribute sales.
-      const refCodeRaw = typeof req.query.ref === 'string' ? req.query.ref : '';
-      const channelRaw = typeof req.query.ch === 'string' ? req.query.ch : '';
+      const refCodeRaw = typeof input.ref === 'string' ? input.ref : '';
+      const channelRaw = typeof input.ch === 'string' ? input.ch : '';
 
       const refCode = refCodeRaw.trim().slice(0, 64); // keep it short & safe
       const shareChannel = channelRaw.trim().slice(0, 64);
   
       const event = await Event.findById(eventId).lean();
       if (!event) {
-        return res.status(404).send('Evento no encontrado');
+        return sendInfoPage(res, 404, { title: 'Evento no encontrado' });
       }
   
       // Misma lógica de validaciones que en create-checkout-session
       const now = new Date();
       if (event.isPublished === false) {
-        return res.status(400).send('Evento no publicado');
+        return sendInfoPage(res, 404, { title: 'Evento no encontrado', message: 'Este evento no existe o ya no está disponible.' });
       }
       if (event.salesStart && now < new Date(event.salesStart)) {
-        return res.status(400).send('La venta todavía no ha empezado');
+        return sendInfoPage(res, 400, { title: 'La venta todavía no ha empezado', event });
       }
       if (event.salesEnd && now > new Date(event.salesEnd)) {
-        return res.status(400).send('La venta ya ha finalizado');
+        return sendInfoPage(res, 400, { title: 'La venta ha finalizado', event });
       }
   
       // === Tandas: solo si el evento tiene ticketTiers activos ===
@@ -378,10 +680,10 @@ router.get('/direct/:eventId', async (req, res) => {
       // Sin tiers, tierSale es null y todo lo de abajo funciona como siempre.
       let tierSale = null;
       if (hasActiveTiers(event)) {
-        const tierParam = typeof req.query.tier === 'string' ? req.query.tier.trim() : '';
+        const tierParam = typeof input.tier === 'string' ? input.tier.trim() : '';
         const sel = resolveTierForSale(event, tierParam, { fallbackToCheapest: true });
         if (sel.error) {
-          return sendSoldOutPage(res, { event, nextTier: null, query: req.query });
+          return sendSoldOutPage(res, { event, nextTier: null, query: input });
         }
         tierSale = sel;
       }
@@ -401,14 +703,18 @@ router.get('/direct/:eventId', async (req, res) => {
           eventPrice: event.price,
           eventPriceEUR: event.priceEUR,
         });
-        return res.status(400).send('Precio inválido');
+        return sendInfoPage(res, 400, {
+          title: 'Entradas no disponibles',
+          message: 'Las entradas de este evento no se venden online.',
+          event,
+        });
       }
 
-      // Cantidad (opcional por query): /direct/:eventId?qty=3
-      const qtyParam = req.query.qty ?? req.query.q;
+      // Cantidad del formulario (1..10, como la app)
+      const qtyParam = input.qty ?? input.q;
       let qty = Math.floor(Number(qtyParam || 1));
       if (!Number.isFinite(qty) || qty < 1) qty = 1;
-      if (qty > 20) qty = 20;
+      if (qty > MAX_QTY_DIRECT) qty = MAX_QTY_DIRECT;
 
       // === Stripe Connect (robusto y retrocompatible) ===
       // IMPORTANTE: en algunos eventos `clubId` puede ser el USER (owner) y `club` puede ser el documento Club.
@@ -437,7 +743,7 @@ router.get('/direct/:eventId', async (req, res) => {
       if (!club) {
         const ownerUserId = event.createdBy || event.clubId || event.organizerId || null;
         if (!ownerUserId) {
-          return res.status(400).send('El evento no tiene club asociado.');
+          return sendInfoPage(res, 400, { title: 'Entradas no disponibles', message: 'El evento no tiene club asociado.', event });
         }
         club = await Club.findOne({ ownerUserId }).lean();
         if (club) clubId = club._id;
@@ -471,7 +777,11 @@ router.get('/direct/:eventId', async (req, res) => {
           eventCreatedBy: event.createdBy ? String(event.createdBy) : null,
           eventOrganizerId: event.organizerId ? String(event.organizerId) : null,
         });
-        return res.status(400).send('El club no tiene cuenta conectada en Stripe (LIVE).');
+        return sendInfoPage(res, 400, {
+          title: 'Entradas no disponibles',
+          message: 'El club todavía no puede vender entradas online.',
+          event,
+        });
       }
 
       // Tema/plantilla para Email + PDF (se aplicará en el webhook)
@@ -515,6 +825,21 @@ router.get('/direct/:eventId', async (req, res) => {
         shareChannel,
       });
   
+      // Tope de entradas reservadas a la vez por IP en este evento: un bucle de
+      // compras sin pagar no puede dejar el evento agotado.
+      const clientIp = String(req.ip || '');
+      const alreadyReserved = await activeReservedQty({ eventId: String(event._id), clientIp });
+      if (alreadyReserved + qty > MAX_ACTIVE_RESERVED_PER_IP) {
+        console.warn('[direct] tope de reservas por IP', {
+          eventId: String(event._id), ip: clientIp, alreadyReserved, qty, max: MAX_ACTIVE_RESERVED_PER_IP,
+        });
+        return sendInfoPage(res, 429, {
+          title: 'Demasiadas entradas pendientes de pago',
+          message: 'Desde tu conexión ya hay muchas entradas de este evento reservadas sin pagar. Termina esos pagos o espera unos minutos.',
+          event,
+        });
+      }
+
       // Order "guest": sin userId ni email (Stripe nos dará el email)
       // Reserva de stock: aquí, ya validados evento, precio, club y Stripe, y
       // justo antes de crear la orden. Ningún return anterior puede dejar una
@@ -525,13 +850,13 @@ router.get('/direct/:eventId', async (req, res) => {
         if (!r.ok) {
           const nextTier =
             r.reason === 'event_sold_out' ? null : laterPurchasableTier(r.event, tierSale.tier);
-          return sendSoldOutPage(res, { event, nextTier, query: req.query });
+          return sendSoldOutPage(res, { event, nextTier, query: input });
         }
         releaseTier = r.release;
       } else {
         const reserved = await reserveStock(event._id, qty);
         if (!reserved) {
-          return sendSoldOutPage(res, { event, nextTier: null, query: req.query });
+          return sendSoldOutPage(res, { event, nextTier: null, query: input });
         }
       }
       const releaseReservation = () => (releaseTier ? releaseTier() : releaseStock(event._id, qty));
@@ -550,7 +875,8 @@ router.get('/direct/:eventId', async (req, res) => {
         status: 'created',
         reservedQty: qty,
         reservationActive: true,
-        expiresAt: new Date(Date.now() + 30 * 60 * 1000),
+        expiresAt: new Date(Date.now() + RESERVATION_MS),
+        clientIp,
         ...(tierSale ? tierOrderFields(tierSale.tier, toCents(unit), qty, event.title) : {}),
       });
       } catch (orderErr) {
@@ -616,7 +942,7 @@ router.get('/direct/:eventId', async (req, res) => {
             ...(tierSale ? tierStripeMeta(tierSale.tier) : {}),
           },
           allow_promotion_codes: true,
-          expires_at: Math.floor(Date.now() / 1000) + 30 * 60,
+          expires_at: Math.floor((Date.now() + RESERVATION_MS) / 1000),
           automatic_tax: { enabled: false },
           payment_intent_data: {
             application_fee_amount: applicationFee,
@@ -630,8 +956,11 @@ router.get('/direct/:eventId', async (req, res) => {
         order.status = 'failed';
         await order.save().catch(() => {});
         console.error('[direct-checkout] error:', stripeErr?.raw || stripeErr);
-        const msg = stripeErr?.raw?.message || 'No se pudo iniciar el pago';
-        return res.status(500).send(msg);
+        return sendInfoPage(res, 500, {
+          title: 'No se pudo iniciar el pago',
+          message: 'Inténtalo de nuevo en unos minutos.',
+          event,
+        });
       }
   
       order.stripeSessionId = session.id;
@@ -651,10 +980,21 @@ router.get('/direct/:eventId', async (req, res) => {
       return res.redirect(303, session.url);
     } catch (err) {
       console.error('[direct-checkout] error:', err?.raw || err);
-      const msg = err?.raw?.message || 'No se pudo iniciar el pago';
-      return res.status(500).send(msg);
+      return sendInfoPage(res, 500, { title: 'No se pudo iniciar el pago', message: 'Inténtalo de nuevo en unos minutos.' });
     }
-  });
+}
+
+// GET: la página del evento (enlace estable para compartir). NO reserva.
+// Las previsualizaciones (WhatsApp, iMessage...) y los HEAD llegan aquí.
+router.get('/direct/:eventId', directPageLimiter, (req, res) =>
+  renderDirectLanding(req, res).catch((err) => {
+    console.error('[direct] error en la página del evento:', err?.message || err);
+    return sendInfoPage(res, 500, { title: 'No se pudo cargar el evento' });
+  })
+);
+// POST: el botón "Comprar". Aquí sí se reserva y se abre Stripe.
+router.post('/direct/:eventId', directStartLimiter, startDirectCheckout);
+
 
 /* ==================================================================
    POST /api/payments/checkout  — compra desde la app (autenticada)
@@ -666,6 +1006,21 @@ const mongoose = require('mongoose');
 const { anyAuth: anyAuthMw } = require('../middlewares/authMiddleware');
 
 const MAX_QTY_APP = 10;
+
+// Compras iniciadas por usuario (va DESPUÉS de resolveAppUser: req.user.id es
+// el _id de Mongo, igual entre JWT y Firebase).
+const checkoutLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => `checkout:${req.user.id}`,
+  handler: (req, res) =>
+    res.status(429).json({
+      error: 'too_many_requests',
+      message: 'Has iniciado muchas compras seguidas. Espera unos minutos y vuelve a intentarlo.',
+    }),
+});
 
 // Deja req.user.id con el _id de Mongo, igual que ensureUserId de eventRoutes.js
 // (el anyAuth de authMiddleware deja el UID de Firebase en req.user.id).
@@ -766,7 +1121,7 @@ function parseReturnUrl(raw) {
   }
 }
 
-router.post('/checkout', anyAuthMw, resolveAppUser, async (req, res) => {
+router.post('/checkout', anyAuthMw, resolveAppUser, checkoutLimiter, async (req, res) => {
   // 1) Limpieza perezosa de reservas caducadas (no bloqueante)
   sweepExpiredReservations().catch(() => {});
 
@@ -855,6 +1210,20 @@ router.post('/checkout', anyAuthMw, resolveAppUser, async (req, res) => {
     const tierId = tier ? tier.tierId : null;
     const tierName = tier ? tier.name : null;
 
+    // 5a) Tope de entradas reservadas a la vez por usuario en este evento
+    const alreadyReserved = await activeReservedQty({ eventId: String(event._id), userId: String(req.user.id) });
+    if (alreadyReserved + qty > MAX_ACTIVE_RESERVED_PER_USER) {
+      console.warn('[checkout] tope de reservas por usuario', {
+        eventId: String(event._id), userId: String(req.user.id), alreadyReserved, qty, max: MAX_ACTIVE_RESERVED_PER_USER,
+      });
+      return res.status(429).json({
+        error: 'too_many_pending',
+        message: 'Ya tienes muchas entradas de este evento pendientes de pago. Termina esos pagos o espera unos minutos.',
+        pending: alreadyReserved,
+        max: MAX_ACTIVE_RESERVED_PER_USER,
+      });
+    }
+
     // 5b/6) Reserva de stock
     let releaseTier = null;
     if (tier) {
@@ -941,7 +1310,7 @@ router.post('/checkout', anyAuthMw, resolveAppUser, async (req, res) => {
         status: 'pending',
         reservedQty: qty,
         reservationActive: true,
-        expiresAt: new Date(Date.now() + 30 * 60 * 1000),
+        expiresAt: new Date(Date.now() + RESERVATION_MS),
       });
     } catch (orderErr) {
       await release();
@@ -1011,7 +1380,7 @@ router.post('/checkout', anyAuthMw, resolveAppUser, async (req, res) => {
           ...(shareChannel ? { shareChannel } : {}),
         },
         allow_promotion_codes: true,
-        expires_at: Math.floor(Date.now() / 1000) + 30 * 60,
+        expires_at: Math.floor((Date.now() + RESERVATION_MS) / 1000),
         automatic_tax: { enabled: false },
         payment_intent_data: {
           application_fee_amount: applicationFee,

@@ -58,17 +58,32 @@ async function sweepExpiredReservations() {
     expiresAt: { $lt: now },
   }).limit(50);
 
+  let released = 0;
   for (const o of stale) {
     try {
-      await releaseStock(o.eventId, o.reservedQty || 0);
-      o.reservationActive = false;
-      o.status = 'expired';
-      await o.save();
+      // Reclamación atómica ANTES de liberar: si el webhook de Stripe
+      // (checkout.session.expired) o otro barrido ya la liberó, no se libera
+      // dos veces.
+      const claimed = await Order.findOneAndUpdate(
+        { _id: o._id, reservationActive: true },
+        { $set: { reservationActive: false, status: 'expired' } }
+      );
+      if (!claimed) continue;
+
+      // Cada orden con SU función: las de tanda bajan ticketTiers[].reserved y
+      // ticketsReserved. Antes se usaba releaseStock para todas, y en las de
+      // tanda el reservado de la tanda se quedaba bloqueado para siempre.
+      if (claimed.tierId) {
+        await releaseTierStock(claimed.eventId, claimed.tierId, claimed.reservedQty || 0);
+      } else {
+        await releaseStock(claimed.eventId, claimed.reservedQty || 0);
+      }
+      released++;
     } catch (e) {
       console.error('[stock] sweep fallo en orden', String(o._id), e.message);
     }
   }
-  if (stale.length) console.log(`[stock] liberadas ${stale.length} reservas caducadas`);
+  if (released) console.log(`[stock] liberadas ${released} reservas caducadas`);
 }
 
 // ─── Funciones para eventos con ticketTiers ───────────────────────────────────
