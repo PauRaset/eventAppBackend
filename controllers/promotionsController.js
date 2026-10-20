@@ -6,6 +6,7 @@ const UserClubPromotionProgress = require('../models/UserClubPromotionProgress')
 const PromotionClaim = require('../models/PromotionClaim');
 const Notification = require('../models/Notification');
 const { sendPushNotificationToUser } = require('../utils/sendPushNotification');
+const { getTemplatesForClub: getTemplatesForClubShared } = require('../utils/promotionTemplates');
 const {
   isPhotoMission,
   PHOTO_CRITERIA_MIN_LENGTH,
@@ -179,7 +180,8 @@ function computeMissionRatio(m) {
 
 function computeLevelProgress(level) {
   const missions = Array.isArray(level.missions) ? level.missions : [];
-  if (missions.length === 0) return 0;
+  // Nivel sin misiones (p. ej. el 10 del catálogo): completo en cuanto se llega a él
+  if (missions.length === 0) return level.status === 'locked' ? 0 : 1;
 
   // pending cuenta como progreso completo visualmente? (yo lo dejo como ratio real)
   const ratios = missions.map(computeMissionRatio);
@@ -200,12 +202,19 @@ function isMissionEffectivelyCompleted(mission) {
   return false;
 }
 
+/**
+ * ¿Nivel superado? Solo si el usuario ya ha LLEGADO a él (no bloqueado): las
+ * misiones acumuladas (scan_qr, attend_event, referidos) llevan current a los
+ * niveles bloqueados, y un nivel bloqueado con current >= target no puede
+ * contar como completado (applyRewardGating saltaría a él).
+ * Un nivel sin misiones está completo en cuanto se llega a él.
+ */
 function isLevelFullyCompleted(level) {
-  if (!level || !Array.isArray(level.missions) || level.missions.length === 0) {
-    return false;
-  }
+  if (!level || level.status === 'locked') return false;
+  const missions = Array.isArray(level.missions) ? level.missions : [];
+  if (missions.length === 0) return true;
 
-  return level.missions.every((mission) => isMissionEffectivelyCompleted(mission));
+  return missions.every((mission) => isMissionEffectivelyCompleted(mission));
 }
 
 function shouldBlockLevelUntilRewardRedeemed(level) {
@@ -534,24 +543,9 @@ async function ensureClubTemplates(clubId) {
   return clubTemplates;
 }
 
-async function getTemplatesForClub(clubId) {
-  // Si existe override por club, lo usamos; si no, global
-  const clubTemplates = await PromotionLevelTemplate.find({
-    scope: 'club',
-    club: clubId,
-    active: true,
-  }).lean();
-
-  if (clubTemplates && clubTemplates.length) {
-    return clubTemplates.sort((a, b) => a.levelNumber - b.levelNumber);
-  }
-
-  const globalTemplates = await PromotionLevelTemplate.find({
-    scope: 'global',
-    active: true,
-  }).lean();
-
-  return (globalTemplates || []).sort((a, b) => a.levelNumber - b.levelNumber);
+// Criterio único (del club si tiene, si no globales): utils/promotionTemplates.js
+function getTemplatesForClub(clubId) {
+  return getTemplatesForClubShared(clubId, { source: 'promotionsController' });
 }
 
 async function ensureProgressDoc({ userId, clubId, templates, userDoc = null }) {
@@ -646,7 +640,7 @@ function syncLevelWithTemplate(existingLevel, templateLevel, levelIndex = 0) {
     : [];
 
   let nextStatus = existingLevel?.status || (nextLevelNumber === 1 ? 'in_progress' : 'locked');
-  if (nextMissions.length && nextMissions.every((mission) => isMissionEffectivelyCompleted(mission))) {
+  if (isLevelFullyCompleted({ status: nextStatus, missions: nextMissions })) {
     nextStatus = 'completed';
   }
 
@@ -959,11 +953,7 @@ function updatePhotoMissionsForLevel(
 function finalizeLevelIfCompleted(progress, level) {
   if (!level || !Array.isArray(level.missions)) return false;
 
-  const allDone =
-    level.missions.length > 0 &&
-    level.missions.every((m) => isMissionEffectivelyCompleted(m));
-
-  if (!allDone) return false;
+  if (!isLevelFullyCompleted(level)) return false;
 
   if (level.status !== 'completed') {
     level.status = 'completed';
@@ -1500,8 +1490,7 @@ exports.approveClaim = async (req, res) => {
 
     if (level) {
       // Si todas misiones completadas => nivel completado
-      const missions = level.missions || [];
-      const allDone = missions.length > 0 && missions.every((m) => isMissionEffectivelyCompleted(m));
+      const allDone = isLevelFullyCompleted(level);
       level.progress = computeLevelProgress(level);
 
       if (allDone && level.status !== 'completed') {
@@ -1637,7 +1626,9 @@ exports.redeemCurrentLevelReward = async (req, res) => {
       return res.status(404).json({ ok: false, error: 'Current level not found' });
     }
 
-    if (Number(level.progress || 0) < 1 || !isLevelFullyCompleted(level)) {
+    // Progreso recalculado (no el guardado): un nivel sin misiones recién
+    // alcanzado puede tener guardado 0 de cuando estaba bloqueado.
+    if (computeLevelProgress(level) < 1 || !isLevelFullyCompleted(level)) {
       return res.status(400).json({ ok: false, error: 'Current level is not completed yet' });
     }
 
@@ -1666,6 +1657,8 @@ exports.redeemCurrentLevelReward = async (req, res) => {
       }
 
       progress.currentLevel = nextLevel.levelNumber;
+      // Nivel sin misiones (el 10): queda completado al llegar, listo para canjear
+      finalizeLevelIfCompleted(progress, nextLevel);
     } else {
       progress.currentLevel = level.levelNumber;
     }
@@ -1674,15 +1667,22 @@ exports.redeemCurrentLevelReward = async (req, res) => {
     progress.lastActivityAt = now();
     await progress.save();
 
-    // El nivel recién desbloqueado recibe el acumulado de referidos del club
-    // (share_event / link_clicks / referred_purchases). Carga perezosa.
+    // El nivel recién desbloqueado recibe el acumulado del club (scan_qr,
+    // attend_event, share_event, link_clicks, referred_purchases): si ya lo
+    // cumple, se completa en el acto. Carga perezosa.
+    let view = progress; // lo que se devuelve: el progreso ya con el acumulado aplicado
     try {
-      await require('../routes/eventRoutes').syncReferralMissions({
+      await require('../routes/eventRoutes').syncAccumulatedMissions({
         userId: String(mongoUser._id),
         clubKey: String(clubId),
       });
+      const fresh = await UserClubPromotionProgress.findOne({ user: mongoUser._id, club: clubId });
+      if (fresh) {
+        refreshCurrentSnapshot(fresh); // aplica también el bloqueo por premio sin canjear
+        view = fresh;
+      }
     } catch (e) {
-      console.warn('[promotions] redeem: referral sync falló:', e?.message || e);
+      console.warn('[promotions] redeem: sync del acumulado falló:', e?.message || e);
     }
 
     const clubDoc = ClubModel && clubId
@@ -1709,17 +1709,17 @@ exports.redeemCurrentLevelReward = async (req, res) => {
     return res.json({
       ok: true,
       clubId,
-      currentLevel: progress.currentLevel,
-      currentProgress: progress.currentProgress,
+      currentLevel: view.currentLevel,
+      currentProgress: view.currentProgress,
       redeemedLevelNumber: level.levelNumber,
       redeemedAt: level.rewardRedeemedAt,
-      levels: Array.isArray(progress.levels)
-        ? progress.levels.map((entry) => ({
+      levels: Array.isArray(view.levels)
+        ? view.levels.map((entry) => ({
             ...entry.toObject(),
             rewardRedeemed: entry.rewardRedeemed === true,
             rewardRedeemedAt: entry.rewardRedeemedAt || null,
             canRedeemReward:
-              Number(entry.levelNumber || 0) === Number(progress.currentLevel || 0) &&
+              Number(entry.levelNumber || 0) === Number(view.currentLevel || 0) &&
               Number(entry.progress || 0) >= 1 &&
               entry.rewardRedeemed !== true,
           }))

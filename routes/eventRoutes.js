@@ -18,6 +18,7 @@ const QrScan = require("../models/QrScan");
 const ShareLink = require("../models/ShareLink");
 const ShareOpen = require("../models/ShareOpen");
 const { isPhotoMission } = require("../utils/photoMissions");
+const { getTemplatesForClub } = require("../utils/promotionTemplates");
 const { reviewPhoto, enqueuePhotoReview, getAutoApproveMin } = require("../utils/photoReview");
 const { makeToken } = require("../utils/ticketToken");
 const User = require("../models/User");
@@ -42,7 +43,6 @@ function parseTiersInput(raw) {
   }
   return { error: "ticketTiers debe ser una lista" };
 }
-const PromotionLevelTemplate = require("../models/PromotionLevelTemplate");
 const UserClubPromotionProgress = require("../models/UserClubPromotionProgress");
 
 // Tu middleware JWT actual (export default)
@@ -547,16 +547,10 @@ async function optionalUserId(req, res, next) {
    PROMOTIONS BRIDGE (auto-progress levels)
 ------------------------------------------------------------------- */
 
-async function getGlobalPromotionTemplates() {
-  const templates = await PromotionLevelTemplate.find({ scope: "global", active: true })
-    .sort({ levelNumber: 1 })
-    .lean();
-  return templates || [];
-}
-
 function computeLevelProgress(level) {
   const missions = Array.isArray(level?.missions) ? level.missions : [];
-  if (!missions.length) return 0;
+  // Nivel sin misiones (p. ej. el 10 del catálogo): completo en cuanto se llega a él
+  if (!missions.length) return level?.status === "locked" ? 0 : 1;
   const ratios = missions.map((m) => {
     const target = Number(m.target || 1);
     const cur = Number(m.current || 0);
@@ -567,12 +561,24 @@ function computeLevelProgress(level) {
 }
 
 function allMissionsCompleted(level) {
-  const missions = Array.isArray(level?.missions) ? level.missions : [];
-  if (!missions.length) return false;
+  if (!level || level.status === "locked") return false;
+  const missions = Array.isArray(level.missions) ? level.missions : [];
+  if (!missions.length) return true; // nivel sin misiones: completo al llegar
   return missions.every((m) => m.status === "completed");
 }
 
 function unlockNextLevel(progress, completedLevelNumber) {
+  // Igual que promotionsController: el siguiente nivel no se abre hasta canjear
+  // el premio de este (lo abre redeemCurrentLevelReward). Antes se abría aquí y
+  // el controlador lo volvía a bloquear al leer, mientras tanto currentLevel
+  // apuntaba a un nivel no alcanzado.
+  const completed = (progress.levels || []).find((l) => Number(l.levelNumber) === Number(completedLevelNumber));
+  if (completed && completed.rewardRedeemed !== true) {
+    progress.currentLevel = Number(completedLevelNumber);
+    progress.currentRewardTitle = completed.reward?.title || "";
+    return;
+  }
+
   const nextLevelNumber = Number(completedLevelNumber) + 1;
   const next = (progress.levels || []).find((l) => Number(l.levelNumber) === nextLevelNumber);
   if (!next) return;
@@ -604,29 +610,6 @@ function refreshCurrentSnapshot(progress) {
 function clampNonNegative(n) {
   const x = Number(n || 0);
   return x < 0 ? 0 : x;
-}
-
-function updateAttendMissionsForLevel(level, counters) {
-  for (const m of level.missions || []) {
-    if (m.type !== "attend_event") continue;
-
-    const platformWide = !!(m.params && m.params.platformWide) || !!(m.meta && m.meta.platformWide);
-    const count = platformWide ? Number(counters.attendancesPlatform || 0) : Number(counters.attendancesInClub || 0);
-
-    m.current = Math.min(count, Number(m.target || 1));
-
-    if (level.status === "locked") continue;
-
-    if (m.current >= Number(m.target || 1)) {
-      m.status = "completed";
-      m.completedAt = m.completedAt || new Date();
-    } else {
-      if (m.status !== "pending") m.status = "in_progress";
-      m.completedAt = null;
-    }
-
-    m.updatedAt = new Date();
-  }
 }
 
 /**
@@ -680,8 +663,17 @@ async function ensurePromotionProgressDoc({ userId, clubId }) {
   let progress = await UserClubPromotionProgress.findOne({ user: userId, club: clubId });
   if (progress) return progress;
 
-  const templates = await getGlobalPromotionTemplates();
-  if (!templates.length) return null;
+  // Mismo criterio que promotionsController: las del club si tiene, si no las
+  // globales (antes aquí solo globales). Sin ninguna, getTemplatesForClub lo
+  // deja en el log.
+  const templates = await getTemplatesForClub(clubId, { source: "eventRoutes" });
+  if (!templates.length) {
+    console.warn("[promotions] progreso NO creado por falta de plantillas", {
+      userId: String(userId || ""),
+      clubId: String(clubId || ""),
+    });
+    return null;
+  }
 
   const built = UserClubPromotionProgress.buildFromTemplates({ templates, startLevel: 1 });
   try {
@@ -831,42 +823,19 @@ async function recordQrScan(req, event) {
   return { firstScan: !previous };
 }
 
-/**
- * Un escaneo (de un evento nuevo) suma 1 a las misiones scan_qr de los niveles
- * YA desbloqueados. Los niveles bloqueados no acumulan: el reto "encuentra el
- * QR" de un nivel se cumple estando en ese nivel, no con escaneos anteriores.
- */
-function updateScanQrMissionsForLevel(level) {
-  if (level.status === "locked") return;
-
-  for (const m of level.missions || []) {
-    if (m.type !== "scan_qr") continue;
-    if (m.status === "completed") continue;
-
-    m.current = Math.min(Number(m.current || 0) + 1, Number(m.target || 1));
-
-    if (m.current >= Number(m.target || 1)) {
-      m.status = "completed";
-      m.completedAt = m.completedAt || new Date();
-    } else if (m.status !== "pending") {
-      m.status = "in_progress";
-    }
-    m.updatedAt = new Date();
-  }
-}
-
-/**
- * Misiones scan_qr: cuenta EVENTOS distintos escaneados en el club (solo se llama
- * en el primer escaneo de cada evento), para que reescanear el mismo QR no infle
- * el contador. Mismo patrón que syncPromotionAfterAttend.
- */
 /* ------------------------------------------------------------------
-   MISIONES DE REFERIDOS (share_event, link_clicks, referred_purchases)
+   MISIONES ACUMULADAS POR CLUB
+     - scan_qr:      eventos DISTINTOS del club cuyo QR ha escaneado (QrScan)
+     - attend_event: eventos del club donde está marcado como asistente
+     - share_event, link_clicks, referred_purchases (referidos)
    Se RECALCULAN desde los datos (idempotente: llamarla de más no cuenta de
-   más, y los reembolsos se descuentan solos). Conteo ACUMULADO en el club:
-   cuenta todo lo hecho en ese club, también antes de llegar al nivel.
+   más, y lo que se deshace —reembolso, desmarcar asistencia— se descuenta
+   solo). Conteo ACUMULADO en el club: cuenta todo lo hecho en ese club,
+   también antes de llegar al nivel, así que 7 eventos escaneados cumplen a la
+   vez los niveles de 2, 4 y 7.
 ------------------------------------------------------------------- */
 const REFERRAL_MISSION_TYPES = new Set(["share_event", "link_clicks", "referred_purchases"]);
+const ACCUMULATED_MISSION_TYPES = new Set([...REFERRAL_MISSION_TYPES, "scan_qr", "attend_event"]);
 
 /** uid de Firebase o _id de Mongo -> _id de Mongo (string), o null. */
 async function resolveMongoUserId(key) {
@@ -890,8 +859,8 @@ async function eventIdsForClubKey(clubKey) {
   return events.filter((e) => promotionClubKeyForEvent(e) === key).map((e) => String(e._id));
 }
 
-/** Recuentos acumulados del usuario en el club. */
-async function computeReferralCounts({ userId, clubKey }) {
+/** Recuentos acumulados del usuario en el club (todas las misiones acumuladas). */
+async function computeAccumulatedCounts({ userId, clubKey }) {
   const me = await User.findById(userId).select("_id firebaseUid email").lean();
   if (!me) return null;
   const myId = String(me._id);
@@ -899,9 +868,15 @@ async function computeReferralCounts({ userId, clubKey }) {
   const myEmail = String(me.email || "").trim().toLowerCase();
 
   const eventIds = await eventIdsForClubKey(clubKey);
-  if (!eventIds.length) return { share_event: 0, link_clicks: 0, referred_purchases: 0 };
+  if (!eventIds.length) {
+    return { share_event: 0, link_clicks: 0, referred_purchases: 0, scan_qr: 0, attend_event: 0 };
+  }
 
-  const [sharedEvents, openers, orders] = await Promise.all([
+  const [scannedEvents, attendedEvents, sharedEvents, openers, orders] = await Promise.all([
+    // scan_qr: eventos DISTINTOS del club escaneados alguna vez (no escaneos)
+    QrScan.distinct("event", { user: me._id, event: { $in: eventIds } }),
+    // attend_event: eventos del club donde sigue marcado como asistente
+    Event.countDocuments({ _id: { $in: eventIds }, attendees: me._id }),
     // share_event: eventos DISTINTOS del club que ha compartido
     ShareLink.distinct("eventId", { createdByUserId: { $in: keys }, eventId: { $in: eventIds } }),
     // link_clicks: personas DISTINTAS (autenticadas, no él) que abrieron sus enlaces
@@ -934,18 +909,21 @@ async function computeReferralCounts({ userId, clubKey }) {
     share_event: sharedEvents.length,
     link_clicks: openers.filter((o) => String(o) !== myId).length,
     referred_purchases: buyers.size,
+    scan_qr: scannedEvents.length,
+    attend_event: attendedEvents,
   };
 }
 
 /**
- * Aplica los recuentos a las misiones de referidos de un nivel.
- * Una misión ya COMPLETADA no se toca: un reembolso posterior no deshace un
- * nivel superado. En las no completadas, current baja si el recuento baja.
- * En niveles bloqueados se actualiza current (acumulado) pero no el estado.
+ * Aplica los recuentos a las misiones acumuladas de un nivel.
+ * Una misión ya COMPLETADA no se toca: un reembolso o desmarcar la asistencia
+ * después no deshace un nivel superado. En las no completadas, current baja si
+ * el recuento baja. En niveles bloqueados se actualiza current (acumulado) pero
+ * no el estado: se completa en cuanto el nivel se desbloquea y se sincroniza.
  */
-function applyReferralCountsToLevel(level, counts) {
+function applyAccumulatedCountsToLevel(level, counts) {
   for (const m of level.missions || []) {
-    if (!REFERRAL_MISSION_TYPES.has(m.type)) continue;
+    if (!ACCUMULATED_MISSION_TYPES.has(m.type)) continue;
     if (m.status === "completed") continue;
 
     const target = Number(m.target || 1);
@@ -963,60 +941,110 @@ function applyReferralCountsToLevel(level, counts) {
   }
 }
 
-async function syncReferralMissions({ userId, clubKey }) {
-  if (!/^[a-fA-F0-9]{24}$/.test(String(userId || "")) || !clubKey) return;
+/**
+ * Recalcula las misiones acumuladas del usuario en el club y guarda.
+ * Opciones para scripts (scripts/backfillAccumulatedMissions.js):
+ *  - dryRun:   calcula pero NO guarda.
+ *  - backfill: no es actividad del usuario: no toca lastActivityAt y solo
+ *              guarda si algo cambia.
+ * Devuelve { before, after, changed } (fotos del progreso) o { error }.
+ */
+async function syncAccumulatedMissions({ userId, clubKey, eventId = null, dryRun = false, backfill = false }) {
+  if (!/^[a-fA-F0-9]{24}$/.test(String(userId || "")) || !clubKey) return { error: "invalid_ids" };
 
   // Si otra sincronización guarda el mismo progreso a la vez, Mongoose rechaza
   // la nuestra (VersionError). Como se RECALCULA desde los datos, reintentar
   // con el documento fresco es seguro: no puede contar de más.
-  for (let attempt = 1; attempt <= 3; attempt++) {
+  // Espera aleatoria entre intentos para que varias a la vez (escaneos seguidos)
+  // no vuelvan a chocar.
+  const MAX_ATTEMPTS = 6;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     try {
-      await syncReferralMissionsOnce({ userId, clubKey });
-      return;
+      return await syncAccumulatedMissionsOnce({ userId, clubKey, eventId, dryRun, backfill });
     } catch (e) {
-      if (e?.name === "VersionError" && attempt < 3) continue;
-      console.warn("[promotions] syncReferralMissions failed:", e?.message || e);
-      return;
-    }
-  }
-}
-
-async function syncReferralMissionsOnce({ userId, clubKey }) {
-  {
-    const counts = await computeReferralCounts({ userId, clubKey });
-    if (!counts) return;
-
-    const progress = await ensurePromotionProgressDoc({ userId, clubId: clubKey });
-    if (!progress) return;
-
-    for (const lvl of progress.levels || []) {
-      applyReferralCountsToLevel(lvl, counts);
-      lvl.progress = computeLevelProgress(lvl);
-    }
-
-    // Completar niveles y, al desbloquear uno, aplicarle también el acumulado.
-    let guard = 0;
-    while (guard++ < 15) {
-      const cur = (progress.levels || []).find((l) => Number(l.levelNumber) === Number(progress.currentLevel));
-      if (!cur) break;
-
-      applyReferralCountsToLevel(cur, counts);
-      cur.progress = computeLevelProgress(cur);
-      if (cur.status !== "completed" && allMissionsCompleted(cur)) {
-        cur.status = "completed";
-        cur.completedAt = new Date();
-        unlockNextLevel(progress, cur.levelNumber);
+      if (e?.name === "VersionError" && attempt < MAX_ATTEMPTS) {
+        await new Promise((r) => setTimeout(r, 20 + Math.floor(Math.random() * 80 * attempt)));
         continue;
       }
-      break;
+      console.warn("[promotions] syncAccumulatedMissions failed:", e?.message || e);
+      return { error: e?.message || String(e) };
     }
-
-    refreshCurrentSnapshot(progress);
-    progress.lastActivityAt = new Date();
-    progress.markModified("levels");
-    await progress.save(); // VersionError -> lo reintenta syncReferralMissions
   }
 }
+
+/** Foto comparable del progreso: nivel actual, contadores y estado de cada misión. */
+function snapshotProgress(progress) {
+  return {
+    currentLevel: Number(progress.currentLevel || 0),
+    qrScansInClub: Number(progress.counters?.qrScansInClub || 0),
+    attendancesInClub: Number(progress.counters?.attendancesInClub || 0),
+    levels: (progress.levels || []).map((l) => ({
+      levelNumber: Number(l.levelNumber),
+      status: l.status,
+      missions: (l.missions || []).map((m) => ({
+        missionKey: m.missionKey,
+        type: m.type,
+        current: Number(m.current || 0),
+        target: Number(m.target || 1),
+        status: m.status,
+      })),
+    })),
+  };
+}
+
+async function syncAccumulatedMissionsOnce({ userId, clubKey, eventId, dryRun = false, backfill = false }) {
+  const counts = await computeAccumulatedCounts({ userId, clubKey });
+  if (!counts) return { error: "user_not_found" };
+
+  // En scripts no se crea progreso nuevo: solo se repasan los que ya existen.
+  const progress = backfill || dryRun
+    ? await UserClubPromotionProgress.findOne({ user: userId, club: clubKey })
+    : await ensurePromotionProgressDoc({ userId, clubId: clubKey });
+  if (!progress) return { error: "progress_not_found" };
+
+  const before = snapshotProgress(progress);
+
+  // Contadores informativos, ahora sacados de los datos (antes se sumaban +1/-1)
+  progress.counters = progress.counters || {};
+  progress.counters.qrScansInClub = counts.scan_qr;
+  progress.counters.attendancesInClub = counts.attend_event;
+
+  for (const lvl of progress.levels || []) {
+    applyAccumulatedCountsToLevel(lvl, counts);
+    lvl.progress = computeLevelProgress(lvl);
+  }
+
+  // Completar niveles y, al desbloquear uno, aplicarle también el acumulado.
+  let guard = 0;
+  while (guard++ < 15) {
+    const cur = (progress.levels || []).find((l) => Number(l.levelNumber) === Number(progress.currentLevel));
+    if (!cur) break;
+
+    applyAccumulatedCountsToLevel(cur, counts);
+    cur.progress = computeLevelProgress(cur);
+    if (cur.status !== "completed" && allMissionsCompleted(cur)) {
+      cur.status = "completed";
+      cur.completedAt = new Date();
+      unlockNextLevel(progress, cur.levelNumber);
+      continue;
+    }
+    break;
+  }
+
+  refreshCurrentSnapshot(progress);
+  const after = snapshotProgress(progress);
+  const changed = JSON.stringify(before) !== JSON.stringify(after);
+  if (dryRun || (backfill && !changed)) return { before, after, changed };
+
+  if (eventId) progress.lastEventId = eventId;
+  if (!backfill) progress.lastActivityAt = new Date();
+  progress.markModified("levels");
+  await progress.save(); // VersionError -> lo reintenta syncAccumulatedMissions
+  return { before, after, changed };
+}
+
+// Nombre anterior: lo usan share.js, el webhook de Stripe y promotionsController.
+const syncReferralMissions = syncAccumulatedMissions;
 
 /**
  * Atajo para share.js, el webhook de Stripe y promociones: recibe la identidad
@@ -1028,56 +1056,22 @@ async function syncReferralForEvent({ userKey, eventId }) {
     if (!userId || !mongoose.isValidObjectId(String(eventId || ""))) return;
     const event = await Event.findById(eventId).select("_id createdBy clubId club").lean();
     const clubKey = promotionClubKeyForEvent(event);
-    if (clubKey) await syncReferralMissions({ userId, clubKey });
+    if (clubKey) await syncAccumulatedMissions({ userId, clubKey });
   } catch (e) {
     console.warn("[promotions] syncReferralForEvent failed:", e?.message || e);
   }
 }
 
-/** Si otra sincronización ha cambiado de nivel, el nivel nuevo recibe el acumulado de referidos. */
-async function syncReferralIfLevelChanged({ userId, clubId, previousLevel, progress }) {
+/** Si otra sincronización ha cambiado de nivel, el nivel nuevo recibe todo el acumulado. */
+async function syncAccumulatedIfLevelChanged({ userId, clubId, previousLevel, progress }) {
   if (progress && Number(progress.currentLevel) !== Number(previousLevel)) {
-    await syncReferralMissions({ userId: String(userId), clubKey: String(clubId) });
+    await syncAccumulatedMissions({ userId: String(userId), clubKey: String(clubId) });
   }
 }
 
+/** QR escaneado: recalcula scan_qr (eventos distintos) y el resto del acumulado. */
 async function syncPromotionAfterQrScan({ userId, clubId, eventId }) {
-  try {
-    const progress = await ensurePromotionProgressDoc({ userId, clubId });
-    if (!progress) return;
-
-    const previousLevel = progress.currentLevel; // para el acumulado de referidos
-    progress.counters = progress.counters || {};
-    progress.counters.qrScansInClub = clampNonNegative((progress.counters.qrScansInClub || 0) + 1);
-
-    for (const lvl of progress.levels || []) {
-      updateScanQrMissionsForLevel(lvl);
-      lvl.progress = computeLevelProgress(lvl);
-    }
-
-    let guard = 0;
-    while (guard++ < 15) {
-      const cur = (progress.levels || []).find((l) => Number(l.levelNumber) === Number(progress.currentLevel));
-      if (!cur) break;
-
-      cur.progress = computeLevelProgress(cur);
-      if (cur.status !== "completed" && allMissionsCompleted(cur)) {
-        cur.status = "completed";
-        cur.completedAt = new Date();
-        unlockNextLevel(progress, cur.levelNumber);
-        continue;
-      }
-      break;
-    }
-
-    refreshCurrentSnapshot(progress);
-    progress.lastEventId = eventId || progress.lastEventId;
-    progress.lastActivityAt = new Date();
-    await progress.save();
-    await syncReferralIfLevelChanged({ userId, clubId, previousLevel, progress });
-  } catch (e) {
-    console.warn("[promotions] syncPromotionAfterQrScan failed:", e?.message || e);
-  }
+  await syncAccumulatedMissions({ userId: String(userId), clubKey: String(clubId), eventId });
 }
 
 /**
@@ -1105,46 +1099,13 @@ async function canManageEvent(req, event) {
   return [club.ownerUserId, ...(club.managers || [])].filter(Boolean).some((p) => ids.has(String(p)));
 }
 
-async function syncPromotionAfterAttend({ userId, clubId, eventId, attendedNow }) {
-  try {
-    const progress = await ensurePromotionProgressDoc({ userId, clubId });
-    if (!progress) return;
-
-    const previousLevel = progress.currentLevel; // para el acumulado de referidos
-    progress.counters = progress.counters || {};
-    const delta = attendedNow ? 1 : -1;
-
-    progress.counters.attendancesInClub = clampNonNegative((progress.counters.attendancesInClub || 0) + delta);
-    progress.counters.attendancesPlatform = clampNonNegative((progress.counters.attendancesPlatform || 0) + delta);
-
-    for (const lvl of progress.levels || []) {
-      updateAttendMissionsForLevel(lvl, progress.counters);
-      lvl.progress = computeLevelProgress(lvl);
-    }
-
-    let guard = 0;
-    while (guard++ < 15) {
-      const cur = (progress.levels || []).find((l) => Number(l.levelNumber) === Number(progress.currentLevel));
-      if (!cur) break;
-
-      cur.progress = computeLevelProgress(cur);
-      if (cur.status !== "completed" && allMissionsCompleted(cur)) {
-        cur.status = "completed";
-        cur.completedAt = new Date();
-        unlockNextLevel(progress, cur.levelNumber);
-        continue;
-      }
-      break;
-    }
-
-    refreshCurrentSnapshot(progress);
-    progress.lastEventId = eventId || progress.lastEventId;
-    progress.lastActivityAt = new Date();
-    await progress.save();
-    await syncReferralIfLevelChanged({ userId, clubId, previousLevel, progress });
-  } catch (e) {
-    console.warn("[promotions] syncPromotionAfterAttend failed:", e?.message || e);
-  }
+/**
+ * Asistencia marcada o desmarcada: recalcula attend_event (eventos del club con
+ * el usuario en attendees) y el resto del acumulado. attendedNow ya no hace
+ * falta: se cuenta desde los datos, no sumando +1/-1.
+ */
+async function syncPromotionAfterAttend({ userId, clubId, eventId }) {
+  await syncAccumulatedMissions({ userId: String(userId), clubKey: String(clubId), eventId });
 }
 
 /**
@@ -1176,7 +1137,7 @@ async function syncPromotionAfterPhotoApproved({
       return false;
     }
 
-    const previousLevel = progress.currentLevel; // para el acumulado de referidos
+    const previousLevel = progress.currentLevel; // para el acumulado del club
     progress.counters = progress.counters || {};
     progress.counters.photosUploadedInClub = clampNonNegative((progress.counters.photosUploadedInClub || 0) + 1);
 
@@ -1224,7 +1185,7 @@ async function syncPromotionAfterPhotoApproved({
     progress.lastEventId = eventId || progress.lastEventId;
     progress.lastActivityAt = new Date();
     await progress.save();
-    await syncReferralIfLevelChanged({ userId, clubId, previousLevel, progress });
+    await syncAccumulatedIfLevelChanged({ userId, clubId, previousLevel, progress });
     return matchedMission;
   } catch (e) {
     console.warn("[promotions] syncPromotionAfterPhotoApproved failed:", e?.message || e);
@@ -1995,9 +1956,11 @@ async function handleQrScanResolve(req, res, rawPayload, logTag) {
       return res.status(404).json({ message: "Evento no encontrado para este QR" });
     }
 
-    const { firstScan } = await recordQrScan(req, event);
+    await recordQrScan(req, event);
     const clubId = promotionClubKeyForEvent(event);
-    if (firstScan && clubId) {
+    if (clubId) {
+      // Recalcula desde los QrScan (eventos distintos): reescanear no suma, y si
+      // una sincronización anterior falló, este escaneo la repara.
       await syncPromotionAfterQrScan({ userId: req.user.id, clubId, eventId: event._id });
     }
 
@@ -4070,9 +4033,9 @@ router.post("/:id/attend", anyAuth, ensureUserId, async (req, res) => {
     }
 
     // 4.5) Promotions: actualizar progreso por asistencia
-    const clubId = event.createdBy ? event.createdBy.toString() : null;
+    const clubId = promotionClubKeyForEvent(event);
     if (clubId) {
-      await syncPromotionAfterAttend({ userId, clubId, eventId, attendedNow });
+      await syncPromotionAfterAttend({ userId, clubId, eventId });
     }
 
     // 5) Responder
@@ -4316,4 +4279,5 @@ module.exports.ticketClaimRouter = ticketClaimRouter;
 // Misiones de referidos: las usan routes/share.js, el webhook de Stripe y promociones
 module.exports.syncReferralForEvent = syncReferralForEvent;
 module.exports.syncReferralMissions = syncReferralMissions;
+module.exports.syncAccumulatedMissions = syncAccumulatedMissions;
 module.exports.resolveMongoUserId = resolveMongoUserId;
