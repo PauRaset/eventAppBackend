@@ -359,6 +359,10 @@ router.post('/orders/:orderId/refund', anyAuthWithId, refundLimiter, async (req,
     if (order.status !== 'paid') {
       return res.status(409).json({ error: 'not_refundable', status: order.status });
     }
+    // Reserva gratuita: no hay nada que devolver por Stripe (se cancela desde la app)
+    if (order.freeReservation) {
+      return res.status(409).json({ error: 'free_reservation', message: 'Es una reserva gratuita: no hay pago que reembolsar' });
+    }
     if (!order.paymentIntentId) {
       return res.status(400).json({ error: 'missing_payment_intent' });
     }

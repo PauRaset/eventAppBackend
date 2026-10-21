@@ -52,6 +52,40 @@ async function commitStock(eventId, qty, { counted = true } = {}) {
   if (counted) await releaseStock(eventId, qty);
 }
 
+/**
+ * Venta directa en UN paso, sin reserva previa (reservas gratuitas: no hay
+ * pago que esperar). Atómica, como reserveStock: suma qty a ticketsSold solo
+ * si vendidas + reservadas + qty <= aforo. Exige aforo (capacity > 0).
+ * Devuelve true si cupo y se contó; false si no queda aforo.
+ */
+async function sellStockDirect(eventId, qty) {
+  if (!qty || qty <= 0) return false;
+  const updated = await Event.findOneAndUpdate(
+    {
+      _id: eventId,
+      capacity: { $gt: 0 },
+      $expr: {
+        $lte: [
+          { $add: [{ $ifNull: ['$ticketsSold', 0] }, { $ifNull: ['$ticketsReserved', 0] }, qty] },
+          '$capacity',
+        ],
+      },
+    },
+    { $inc: { ticketsSold: qty } },
+    { new: true }
+  );
+  return !!updated;
+}
+
+/** Devuelve plazas vendidas (cancelación de una reserva gratuita). Nunca deja el contador negativo. */
+async function releaseSoldStock(eventId, qty) {
+  if (!qty || qty <= 0) return;
+  await Event.updateOne(
+    { _id: eventId, ticketsSold: { $gte: qty } },
+    { $inc: { ticketsSold: -qty } }
+  );
+}
+
 /** ¿Sumó la reserva de esta orden a ticketsReserved? null (órdenes antiguas) = sí. */
 function orderReservationCounted(order) {
   return !!order && order.reservationCounted !== false;
@@ -333,6 +367,7 @@ async function addTierSoldWithoutReservation(eventId, tierId, qty) {
 module.exports = {
   reserveStock, releaseStock, commitStock, sweepExpiredReservations,
   releaseOrderStock, orderReservationCounted,
+  sellStockDirect, releaseSoldStock,
   availableTiers, tierRemaining,
   reserveTierStock, releaseTierStock, commitTierStock, addTierSoldWithoutReservation,
 };

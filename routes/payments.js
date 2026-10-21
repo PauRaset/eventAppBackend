@@ -9,14 +9,14 @@ const { reserveStock, releaseStock, sweepExpiredReservations } = require('../uti
 const { accessTypeOf } = require('../utils/accessType');
 
 // Respuesta para eventos gratuitos en las rutas de compra (Stripe no admite 0 €).
-//  free_limited: las entradas gratis se emitirán sin Stripe (próxima entrega) -> 501
+//  free_limited: la plaza se reserva gratis desde la app (POST /api/events/:id/reserve) -> 400
 //  free_open:    no hace falta entrada, basta marcar asistencia -> 400
 const FREE_ACCESS_ERRORS = {
   free_limited: {
-    status: 501,
-    error: 'free_tickets_not_implemented',
-    title: 'Reserva de entradas gratuitas',
-    message: 'Las entradas gratuitas de este evento todavía no se pueden reservar online.',
+    status: 400,
+    error: 'free_reservation_required',
+    title: 'Evento gratuito',
+    message: 'Este evento es gratuito con aforo limitado: reserva tu plaza gratis desde la app NightVibe.',
   },
   free_open: {
     status: 400,
@@ -491,7 +491,17 @@ function directPurchaseState(event) {
     return { options: [], blocked: 'Entrada libre: no necesitas entrada. Marca que vas desde la app.', label: 'Entrada libre', maxQty: 0 };
   }
   if (access === 'free_limited') {
-    return { options: [], blocked: 'Evento gratuito con aforo limitado. Muy pronto podrás reservar tu entrada aquí.', label: 'Gratis · aforo limitado', maxQty: 0 };
+    const left = event.capacity > 0
+      ? Math.max(0, event.capacity - (event.ticketsSold || 0) - (event.ticketsReserved || 0))
+      : null;
+    return {
+      options: [],
+      blocked: left === 0
+        ? 'Evento gratuito: no quedan plazas.'
+        : 'Evento gratuito con aforo limitado. Reserva tu plaza gratis desde la app NightVibe.',
+      label: 'Gratis · aforo limitado',
+      maxQty: 0,
+    };
   }
   if (event.salesStart && now < new Date(event.salesStart)) {
     return { options: [], blocked: `La venta empieza el ${formatEventDate(event.salesStart)}`, maxQty: 0 };

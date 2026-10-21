@@ -934,6 +934,11 @@ app.post("/api/checkin", checkinLimiter, async (req, res) => {
       await logTicket("refunded");
       return res.json({ ok: false, reason: "refunded" });
     }
+    // c2) Reserva gratuita cancelada por su dueño: no vale en la puerta
+    if (ticket.status === "cancelled") {
+      await logTicket("cancelled");
+      return res.json({ ok: false, reason: "cancelled" });
+    }
 
     // Evento de la entrada (título, tiers, club y fechas)
     let ev = null;
@@ -1010,6 +1015,10 @@ app.post("/api/checkin", checkinLimiter, async (req, res) => {
       if (fresh?.status === "refunded") {
         await logTicket("refunded");
         return res.json({ ok: false, reason: "refunded" });
+      }
+      if (fresh?.status === "cancelled") {
+        await logTicket("cancelled");
+        return res.json({ ok: false, reason: "cancelled" });
       }
       await logTicket("duplicate");
       return res.json(duplicateBody(fresh));

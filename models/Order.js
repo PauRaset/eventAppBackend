@@ -44,10 +44,20 @@ const OrderSchema = new mongoose.Schema(
     /* -------- Estados -------- */
     status: {
       type: String,
-      enum: ['created', 'pending', 'paid', 'refunded', 'failed', 'expired'],
+      // cancelled: reserva gratuita anulada por su dueño (plaza devuelta)
+      enum: ['created', 'pending', 'paid', 'refunded', 'failed', 'expired', 'cancelled'],
       default: 'pending',
       index: true,
     },
+
+    /* -------- Reserva gratuita (eventos free_limited) -------- */
+    // Orden de importe 0 creada por POST /api/events/:id/reserve, sin Stripe.
+    freeReservation: { type: Boolean, default: false },
+    cancelledAt:     { type: Date, default: null },
+
+    // Cuándo se contó la venta en el evento (ticketsSold). Se reclama de forma
+    // atómica: si la emisión falla y se reintenta, la venta no se cuenta dos veces.
+    stockCommittedAt: { type: Date, default: null },
 
     /* -------- Metadatos auxiliares -------- */
     emailSentAt:   { type: Date,   default: null },
@@ -107,6 +117,12 @@ OrderSchema.index({ eventId: 1, status: 1, createdAt: -1 });
 // Reservas activas de un comprador en un evento (topes de /direct y /checkout)
 OrderSchema.index({ eventId: 1, reservationActive: 1, clientIp: 1 });
 OrderSchema.index({ eventId: 1, reservationActive: 1, userId: 1 });
+// Una sola reserva gratuita ACTIVA por persona y evento (dos peticiones a la
+// vez: la segunda choca aquí). Al cancelarla (status 'cancelled') deja de contar.
+OrderSchema.index(
+  { eventId: 1, userId: 1 },
+  { unique: true, partialFilterExpression: { freeReservation: true, status: 'paid' } }
+);
 OrderSchema.index({ clubId: 1, eventId: 1, status: 1, refUserId: 1, createdAt: -1 });
 
 module.exports = mongoose.model('Order', OrderSchema);

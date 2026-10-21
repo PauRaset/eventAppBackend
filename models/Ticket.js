@@ -8,7 +8,9 @@ const TicketSchema = new mongoose.Schema({
   ticketTypeId: { type: String, default: null },
   serial: { type: String, unique: true, index: true }, // ej. NV-7F3K-92
   tokenHash: { type: String, unique: true, index: true }, // hash del token
-  status: { type: String, enum: ['issued','checked_in','refunded'], default: 'issued' },
+  // cancelled: reserva gratuita anulada por su dueño (no vale en la puerta)
+  status: { type: String, enum: ['issued','checked_in','refunded','cancelled'], default: 'issued' },
+  cancelledAt: { type: Date, default: null },
   issuedAt: { type: Date, default: Date.now },
   checkedInAt: { type: Date, default: null },
   checkedInBy: { type: String, default: null },

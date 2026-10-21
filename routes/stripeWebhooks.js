@@ -1,8 +1,6 @@
 // routes/stripeWebhooks.js
 const express2 = require('express');
 const Stripe2 = require('stripe');
-const crypto = require('crypto');
-const QRCode = require('qrcode');
 const Order2 = require('../models/Order');
 const UnmatchedPayment = require('../models/UnmatchedPayment');
 let ShareLink;
@@ -13,15 +11,17 @@ try {
 }
 const Event2 = require('../models/Event');
 const Ticket = require('../models/Ticket');
-const sendTicketEmail = require('../utils/sendTicketEmail');
+const {
+  commitOrderStock,
+  issueTicketsForOrder,
+  sendOrderTicketsEmail,
+} = require('../utils/ticketIssuing');
 
 const router2 = express2.Router();
 const stripe2 = new Stripe2(process.env.STRIPE_SECRET_KEY, {
   apiVersion: '2024-06-20',
 });
 
-// Serial y token del QR: compartidos con /api/events/my-tickets/:ticketId/qr
-const { genSerial, makeToken } = require('../utils/ticketToken');
 
 /**
  * Recalcula la misión referred_purchases de quien compartió el enlace de esta
@@ -42,24 +42,6 @@ function syncReferralForOrder(order, motivo) {
         console.warn(`[stripe webhook] referral sync (${motivo}) falló:`, e?.message || e)
       );
   });
-}
-
-async function sendTicketEmailWithRetry(payload, { attempts = 3, baseDelayMs = 800 } = {}) {
-  let lastErr;
-  for (let i = 1; i <= attempts; i++) {
-    try {
-      return await sendTicketEmail(payload);
-    } catch (err) {
-      lastErr = err;
-      const status = err?.code || err?.response?.statusCode;
-      console.warn(`[stripe webhook] intento email ${i}/${attempts} falló (status=${status}):`, err?.message || err);
-      if (/Email destinatario inválido/i.test(String(err?.message || ''))) break;
-      if (i < attempts) {
-        await new Promise((r) => setTimeout(r, baseDelayMs * i));
-      }
-    }
-  }
-  throw lastErr;
 }
 
 router2.post('/', express2.raw({ type: 'application/json' }), async (req, res) => {
@@ -233,135 +215,31 @@ router2.post('/', express2.raw({ type: 'application/json' }), async (req, res) =
         return res.json({ ok: true, alreadyIssued: true });
       }
 
-      // --- Actualizar contador ticketsSold ---
-      const {
-        commitStock,
-        commitTierStock,
-        addTierSoldWithoutReservation,
-        orderReservationCounted,
-      } = require('../utils/stock');
-      if (order.reservationActive) {
-        if (order.tierId) {
-          await commitTierStock(eventId, order.tierId, usedQty);   // tier: sold+, reserved-
-        } else {
-          // suma venta y libera reserva (solo si la reserva sumó: aforo ilimitado no suma)
-          await commitStock(eventId, usedQty, { counted: orderReservationCounted(order) });
-        }
-        order.reservationActive = false;
-        // Persistimos ya: si la emisión falla y Stripe reintenta, no volvemos a sumar.
-        await order.save();
-      } else if (order.tierId) {
-        // Orden de tanda cuya reserva ya se liberó (caducó justo antes del pago):
-        // la venta cuenta igualmente en la tanda.
-        await addTierSoldWithoutReservation(eventId, order.tierId, usedQty);
-      } else {
-        // Orden sin reserva (compras antiguas o creadas al vuelo)
-        await Event2.updateOne({ _id: eventId }, { $inc: { ticketsSold: usedQty } });
-      }
+      // --- Venta, entradas y email: utils/ticketIssuing.js (común con la reserva gratuita) ---
+      // Venta contada UNA vez aunque Stripe reintente (Order.stockCommittedAt)
+      await commitOrderStock(order, { eventId, qty: usedQty });
 
-      const created = [];
-      for (let i = 0; i < usedQty; i++) {
-        const serial = genSerial();
-        const token = makeToken(serial);
-        const tokenHash = crypto
-          .createHash('sha256')
-          .update(token)
-          .digest('hex');
-        const qrPayload = JSON.stringify({ serial, token });
-        const qrPngBuffer = await QRCode.toBuffer(qrPayload, {
-          type: 'png',
-          scale: 6,
-          margin: 1,
-        });
-
-        const t = await Ticket.create({
-          eventId,
-          orderId: order._id,
-          ownerUserId: userId,
-          email: order.email || stripeEmail,
-          ticketTypeId: order.tierId || null,
-          serial,
-          tokenHash,
-          status: 'issued',
-        });
-
-        created.push({ doc: t, qrPngBuffer });
-      }
-
-      order.ticketsIssuedAt = new Date();
-      await order.save();
+      // Solo las entradas que faltan (un intento anterior pudo quedarse a medias)
+      const toEmail = order.email || stripeEmail;
+      const issued = await issueTicketsForOrder({
+        order,
+        eventId,
+        qty: usedQty,
+        ownerUserId: userId,
+        email: toEmail,
+      });
 
       // --- Enviar email (1 SOLO correo con N entradas) ---
-      try {
-        const freshEvt = evt || (await Event2.findById(eventId).lean());
-        const clubName =
-          freshEvt?.clubName || freshEvt?.club?.entityName || '';
-        const venue = freshEvt?.locationName || freshEvt?.venue || '';
-        const eventDate = freshEvt?.startAt
-          ? new Date(freshEvt.startAt).toLocaleString('es-ES', {
-              dateStyle: 'medium',
-              timeStyle: 'short',
-            })
-          : '';
-
-        const toEmail = order.email || stripeEmail;
-        if (!toEmail) {
-          console.warn('[stripe webhook] No email found in order/session; skipping email send.', {
-            orderId: String(order._id),
-            sessionId,
-          });
-        } else {
-          // Nuevo payload: lista de tickets para PDF multipase (1 email, 1 PDF con N entradas)
-          const tickets = created.map((x) => ({
-            serial: x.doc.serial,
-            qrPngBuffer: x.qrPngBuffer,
-          }));
-
-          console.log(
-            '[stripe webhook] sending ticket email to',
-            toEmail,
-            'qty=',
-            tickets.length
-          );
-
-          await sendTicketEmailWithRetry({
-            to: toEmail,
-            eventTitle: freshEvt?.title || 'Entrada NightVibe',
-            clubName,
-            eventDate,
-            venue,
-
-            // ✅ NUEVO: todos los tickets
-            tickets,
-
-            // ✅ Retrocompatibilidad (por si sendTicketEmail aún espera 1)
-            serial: tickets[0]?.serial,
-            qrPngBuffer: tickets[0]?.qrPngBuffer,
-
-            ticketTheme: ticketThemeResolved,
-            buyerName: '',
-          });
-
-          try {
-            order.emailSentAt = new Date();
-            order.emailLastTo = toEmail;
-            order.emailError = null;
-            order.emailAttempts = (order.emailAttempts || 0) + 1;
-            await order.save();
-          } catch (persistErr) {
-            console.error('[stripe webhook] no se pudo guardar emailSentAt:', persistErr?.message || persistErr);
-          }
-        }
-      } catch (e) {
-        console.error('Email ticket error:', e);
-        try {
-          order.emailError = String(e?.message || e).slice(0, 500);
-          order.emailAttempts = (order.emailAttempts || 0) + 1;
-          await order.save();
-        } catch (persistErr) {
-          console.error('[stripe webhook] no se pudo guardar emailError:', persistErr?.message || persistErr);
-        }
-      }
+      await sendOrderTicketsEmail({
+        order,
+        event: evt,
+        eventId,
+        toEmail,
+        ticketTheme: ticketThemeResolved,
+        tickets: issued.tickets,
+        logTag: 'stripe webhook',
+        logContext: { sessionId },
+      });
     }
 
     if (event.type === 'checkout.session.expired') {

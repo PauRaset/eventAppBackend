@@ -26,7 +26,9 @@ const Notification = require("../models/Notification");
 const { sendPushNotificationToUser } = require("../utils/sendPushNotification");
 const { geocodeAddress, applyGeo, buildAddress } = require("../utils/geocode");
 const { sanitizeTiers, validateTierChanges, syncEventPrice } = require("../utils/tiers");
-const { accessInfo, validateAccessType, deriveAccessType } = require("../utils/accessType");
+const { accessInfo, accessTypeOf, validateAccessType, deriveAccessType } = require("../utils/accessType");
+const { issueTicketsForOrder, sendOrderTicketsEmail } = require("../utils/ticketIssuing");
+const { sellStockDirect, releaseSoldStock } = require("../utils/stock");
 
 /**
  * accessType a guardar al crear/editar un evento, con precio y tandas FINALES.
@@ -2102,7 +2104,7 @@ router.get("/my-tickets", optionalUserId, async (req, res) => {
     // Tiene entrada si la compró (Order pagada) O si se la han asignado (Ticket)
     const [orderEventIds, assignedEventIds] = await Promise.all([
       Order.distinct("eventId", { userId: { $in: buyerIds }, status: "paid" }),
-      Ticket.distinct("eventId", { assignedToUserId: { $in: buyerIds }, status: { $ne: "refunded" } }),
+      Ticket.distinct("eventId", { assignedToUserId: { $in: buyerIds }, status: { $nin: ["refunded", "cancelled"] } }),
     ]);
 
     const eventIds = [
@@ -2386,7 +2388,8 @@ router.get("/my-tickets/full", anyAuth, ensureUserId, async (req, res) => {
     if (!viewerFilter) return res.json([]);
 
     // ownerUserId/email solo para decidir el papel (isTicketOwner); NO se devuelven.
-    const tickets = await Ticket.find(viewerFilter)
+    // Las reservas gratuitas canceladas no se listan (la plaza ya se devolvió).
+    const tickets = await Ticket.find({ $and: [viewerFilter, { status: { $ne: "cancelled" } }] })
       .select(
         "_id eventId orderId serial status issuedAt checkedInAt ticketTypeId ownerUserId email " +
           "assignedToName assignedToPhone assignedToUserId assignedAt claimToken claimedAt"
@@ -2571,6 +2574,9 @@ router.get("/my-tickets/:ticketId/qr", anyAuth, ensureUserId, async (req, res) =
     if (ticket.status === "refunded") {
       return res.status(403).json({ reason: "refunded", message: "Esta entrada está reembolsada" });
     }
+    if (ticket.status === "cancelled") {
+      return res.status(403).json({ reason: "cancelled", message: "Esta reserva está cancelada" });
+    }
 
     if (!ticket.serial) {
       return res.status(409).json({ message: "La entrada no tiene serial" });
@@ -2593,6 +2599,9 @@ async function assignmentConflict(res, ticketId) {
   }
   if (fresh?.status === "refunded") {
     return res.status(409).json({ error: "refunded", message: "Esta entrada está reembolsada" });
+  }
+  if (fresh?.status === "cancelled") {
+    return res.status(409).json({ error: "cancelled", message: "Esta reserva está cancelada" });
   }
   return res.status(409).json({ error: "conflict", message: "La entrada ha cambiado, inténtalo de nuevo" });
 }
@@ -2689,6 +2698,9 @@ router.post("/my-tickets/:ticketId/assign", anyAuth, ensureUserId, assignLimiter
 
     if (ticket.status === "refunded") {
       return res.status(409).json({ error: "refunded", message: "Esta entrada está reembolsada" });
+    }
+    if (ticket.status === "cancelled") {
+      return res.status(409).json({ error: "cancelled", message: "Esta reserva está cancelada" });
     }
 
     const body = req.body || {};
@@ -2808,7 +2820,7 @@ ticketClaimRouter.get("/claim/:claimToken", claimLimiter, async (req, res) => {
       .select("_id serial status eventId orderId ticketTypeId assignedToName claimedAt")
       .lean();
     // Reembolsada: mismo 404, sin dar detalles
-    if (!ticket || ticket.status === "refunded" || !ticket.serial) return notFound();
+    if (!ticket || ticket.status === "refunded" || ticket.status === "cancelled" || !ticket.serial) return notFound();
 
     const ev = mongoose.isValidObjectId(String(ticket.eventId))
       ? await Event.findById(ticket.eventId)
@@ -2878,7 +2890,7 @@ router.get("/:id/has-ticket", optionalUserId, async (req, res) => {
     // Tiene entrada si la compró (Order pagada) O si se la han asignado (Ticket)
     const [order, assigned] = await Promise.all([
       Order.findOne({ eventId, userId: { $in: buyerIds }, status: "paid" }).select("_id").lean(),
-      Ticket.findOne({ eventId, assignedToUserId: { $in: buyerIds }, status: { $ne: "refunded" } })
+      Ticket.findOne({ eventId, assignedToUserId: { $in: buyerIds }, status: { $nin: ["refunded", "cancelled"] } })
         .select("_id")
         .lean(),
     ]);
@@ -4039,6 +4051,219 @@ router.delete("/:id/photos/:pid?", anyAuth, ensureUserId, async (req, res) => {
    - Alterna en Mongo (campo attendees)
    - Escribe/borra doc en Firestore: attendances/{uid}_{eventId}
 ------------------------------------------------------------------- */
+/* ------------------------------------------------------------------
+   RESERVA GRATUITA (eventos accessType 'free_limited')
+   POST   /api/events/:id/reserve  -> plaza + entrada con QR + email, sin Stripe
+   DELETE /api/events/:id/reserve  -> anula la reserva y devuelve la plaza
+   Una plaza por persona y evento. El aforo se comprueba de forma atómica
+   (sellStockDirect) y se confirma en el acto: no hay pago que esperar.
+------------------------------------------------------------------- */
+const FREE_RESERVATION_LABEL = "Gratuita · plaza reservada"; // "Entrada:" en el email y el PDF
+
+// Por usuario (va DESPUÉS de la autenticación): reservar y cancelar en bucle
+const reserveLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  limit: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => `reserve:${req.user.id}`,
+  handler: (_req, res) =>
+    res.status(429).json({ error: "rate_limited", message: "Demasiados intentos seguidos, espera unos minutos" }),
+});
+
+/** Email utilizable para enviar la entrada (descarta los `<uid>@firebase.local`). */
+function usableEmailForTickets(email) {
+  const e = typeof email === "string" ? email.trim() : "";
+  if (!e || /@firebase\.local$/i.test(e)) return null;
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e) ? e : null;
+}
+
+router.post("/:id/reserve", anyAuth, ensureUserId, reserveLimiter, async (req, res) => {
+  const eventId = String(req.params.id || "");
+  try {
+    if (!mongoose.isValidObjectId(eventId)) {
+      return res.status(400).json({ error: "invalid_event", message: "ID de evento inválido" });
+    }
+    const event = await Event.findById(eventId).lean();
+    if (!event || event.isPublished === false) {
+      return res.status(404).json({ error: "event_not_found", message: "Evento no encontrado" });
+    }
+
+    const accessType = accessTypeOf(event);
+    if (accessType !== "free_limited") {
+      return res.status(400).json({
+        error: "not_free_limited",
+        accessType,
+        message:
+          accessType === "paid"
+            ? "Este evento es de pago: compra la entrada"
+            : "Este evento es de entrada libre: no necesitas reservar",
+      });
+    }
+
+    const now = Date.now();
+    if (event.salesStart && now < new Date(event.salesStart).getTime()) {
+      return res.status(400).json({ error: "sales_not_started", message: "Las reservas todavía no han empezado" });
+    }
+    if (event.salesEnd && now > new Date(event.salesEnd).getTime()) {
+      return res.status(400).json({ error: "sales_ended", message: "Las reservas ya han terminado" });
+    }
+    const { endMs } = eventTimes(event);
+    if (endMs !== null && endMs < now) {
+      return res.status(400).json({ error: "event_ended", message: "Este evento ya ha terminado" });
+    }
+
+    const user = await User.findById(req.user.id).select("_id email firebaseUid").lean();
+    if (!user) return res.status(401).json({ error: "unauthorized", message: "Usuario no encontrado" });
+    const userId = String(user._id);
+    const ids = [userId, user.firebaseUid].filter(Boolean).map(String);
+
+    // ¿Ya tiene entrada válida para este evento (suya o asignada)?
+    const hasTicket = await Ticket.exists({
+      eventId: String(event._id),
+      status: { $in: ["issued", "checked_in"] },
+      $or: [{ ownerUserId: { $in: ids } }, { assignedToUserId: { $in: ids } }],
+    });
+    if (hasTicket) {
+      return res.status(409).json({ error: "already_reserved", message: "Ya tienes una entrada para este evento" });
+    }
+
+    const email = usableEmailForTickets(user.email);
+
+    // 1) Orden de importe 0. El índice único (evento + usuario, reserva activa)
+    //    para la segunda de dos peticiones simultáneas.
+    let order;
+    try {
+      order = await Order.create({
+        freeReservation: true,
+        userId,
+        eventId: String(event._id),
+        clubId: event.club ? String(event.club) : event.clubId || null,
+        qty: 1,
+        amountEUR: 0,
+        currency: "eur",
+        email,
+        status: "paid",
+        paymentMethod: "free",
+        reservedQty: 0,
+        reservationActive: false,
+      });
+    } catch (e) {
+      if (e?.code === 11000) {
+        return res.status(409).json({ error: "already_reserved", message: "Ya tienes una entrada para este evento" });
+      }
+      throw e;
+    }
+
+    // 2) Plaza: comprobación de aforo y venta en UN paso atómico
+    const seat = await sellStockDirect(event._id, 1);
+    if (!seat) {
+      await Order.updateOne({ _id: order._id }, { $set: { status: "failed" } });
+      return res.status(409).json({ error: "sold_out", remaining: 0, message: "No quedan plazas" });
+    }
+    order.stockCommittedAt = new Date();
+    await order.save();
+
+    // 3) Entrada con su QR (misma función que el pago). Si falla, se deshace todo.
+    let issued;
+    try {
+      issued = await issueTicketsForOrder({ order, eventId: String(event._id), qty: 1, ownerUserId: userId, email });
+    } catch (issueErr) {
+      console.error("[reserve] fallo emitiendo la entrada; se devuelve la plaza", {
+        eventId,
+        orderId: String(order._id),
+        error: issueErr?.message || issueErr,
+      });
+      await Ticket.deleteMany({ orderId: order._id }).catch(() => {});
+      await releaseSoldStock(event._id, 1).catch(() => {});
+      await Order.updateOne({ _id: order._id }, { $set: { status: "failed" } }).catch(() => {});
+      return res.status(500).json({ error: "reserve_failed", message: "No se pudo emitir la entrada, inténtalo de nuevo" });
+    }
+
+    const ticket = issued.tickets[0];
+    console.log("[reserve] plaza reservada", { eventId, userId, orderId: String(order._id), serial: ticket?.serial });
+
+    // 4) Email en segundo plano: no hace esperar a la app (la entrada ya está en "Mis entradas")
+    if (email) {
+      setImmediate(() => {
+        sendOrderTicketsEmail({
+          order,
+          event,
+          eventId: String(event._id),
+          toEmail: email,
+          ticketTheme: (typeof event.ticketTheme === "string" && event.ticketTheme.trim()) || "default",
+          tickets: issued.tickets,
+          seatLabel: FREE_RESERVATION_LABEL,
+          logTag: "reserve",
+        }).catch(() => {});
+      });
+    }
+
+    return res.status(201).json({
+      ok: true,
+      orderId: String(order._id),
+      ticket: { ticketId: String(ticket.doc._id), serial: ticket.serial, status: "issued" },
+      emailQueued: !!email,
+      ...(email ? {} : { emailNote: "Tu cuenta no tiene email: la entrada está en Mis entradas" }),
+    });
+  } catch (err) {
+    console.error("[POST /events/:id/reserve] error:", err);
+    return res.status(500).json({ error: "server_error", message: "Error reservando la plaza" });
+  }
+});
+
+router.delete("/:id/reserve", anyAuth, ensureUserId, reserveLimiter, async (req, res) => {
+  const eventId = String(req.params.id || "");
+  try {
+    if (!mongoose.isValidObjectId(eventId)) {
+      return res.status(400).json({ error: "invalid_event", message: "ID de evento inválido" });
+    }
+
+    // Solo el dueño: su propia reserva gratuita activa
+    const order = await Order.findOne({
+      eventId,
+      userId: String(req.user.id),
+      freeReservation: true,
+      status: "paid",
+    }).lean();
+    if (!order) {
+      return res.status(404).json({ error: "no_reservation", message: "No tienes una reserva para este evento" });
+    }
+
+    // Entrada: issued -> cancelled, de forma atómica (si se usó en la puerta, no)
+    const now = new Date();
+    const cancelled = await Ticket.updateMany(
+      { orderId: order._id, status: "issued" },
+      { $set: { status: "cancelled", cancelledAt: now } }
+    );
+    const used = await Ticket.exists({ orderId: order._id, status: "checked_in" });
+    if (used) {
+      return res.status(409).json({ error: "already_used", message: "Esta entrada ya se ha usado en la puerta" });
+    }
+
+    // Orden: paid -> cancelled UNA vez; quien la reclama devuelve la plaza
+    const claimed = await Order.findOneAndUpdate(
+      { _id: order._id, status: "paid" },
+      { $set: { status: "cancelled", cancelledAt: now } }
+    );
+    if (claimed && claimed.stockCommittedAt) {
+      await releaseSoldStock(eventId, claimed.qty || 1);
+    }
+
+    console.log("[reserve] reserva cancelada", {
+      eventId,
+      userId: String(req.user.id),
+      orderId: String(order._id),
+      tickets: cancelled.modifiedCount ?? cancelled.nModified ?? 0,
+      released: !!claimed,
+    });
+    return res.json({ ok: true, released: claimed ? claimed.qty || 1 : 0 });
+  } catch (err) {
+    console.error("[DELETE /events/:id/reserve] error:", err);
+    return res.status(500).json({ error: "server_error", message: "Error cancelando la reserva" });
+  }
+});
+
 router.post("/:id/attend", anyAuth, ensureUserId, async (req, res) => {
   const eventId = req.params.id;
 
