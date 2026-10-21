@@ -238,12 +238,14 @@ router2.post('/', express2.raw({ type: 'application/json' }), async (req, res) =
         commitStock,
         commitTierStock,
         addTierSoldWithoutReservation,
+        orderReservationCounted,
       } = require('../utils/stock');
       if (order.reservationActive) {
         if (order.tierId) {
           await commitTierStock(eventId, order.tierId, usedQty);   // tier: sold+, reserved-
         } else {
-          await commitStock(eventId, usedQty);   // suma venta y libera reserva
+          // suma venta y libera reserva (solo si la reserva sumó: aforo ilimitado no suma)
+          await commitStock(eventId, usedQty, { counted: orderReservationCounted(order) });
         }
         order.reservationActive = false;
         // Persistimos ya: si la emisión falla y Stripe reintenta, no volvemos a sumar.
@@ -370,12 +372,9 @@ router2.post('/', express2.raw({ type: 'application/json' }), async (req, res) =
         { $set: { reservationActive: false, status: 'expired' } }
       );
       if (order) {
-        const { releaseStock, releaseTierStock } = require('../utils/stock');
-        if (order.tierId) {
-          await releaseTierStock(order.eventId, order.tierId, order.reservedQty || 0);
-        } else {
-          await releaseStock(order.eventId, order.reservedQty || 0);
-        }
+        // Tanda o evento, y solo si la reserva sumó de verdad (Order.reservationCounted)
+        const { releaseOrderStock } = require('../utils/stock');
+        await releaseOrderStock(order);
         console.log('[stripe webhook] reserva liberada por expiración:', String(order._id));
       }
     }

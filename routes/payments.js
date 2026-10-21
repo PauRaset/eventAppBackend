@@ -881,6 +881,7 @@ async function startDirectCheckout(req, res) {
       // justo antes de crear la orden. Ningún return anterior puede dejar una
       // reserva sin orden (que el sweep no sabría encontrar ni liberar).
       let releaseTier = null;
+      let reservationCounted = true; // las tandas siempre suman (reserveTierStock)
       if (tierSale) {
         const r = await reserveResolvedTier(event, tierSale.tier, qty);
         if (!r.ok) {
@@ -891,11 +892,14 @@ async function startDirectCheckout(req, res) {
         releaseTier = r.release;
       } else {
         const reserved = await reserveStock(event._id, qty);
-        if (!reserved) {
+        if (!reserved.ok) {
           return sendSoldOutPage(res, { event, nextTier: null, query: input });
         }
+        reservationCounted = reserved.counted;
       }
-      const releaseReservation = () => (releaseTier ? releaseTier() : releaseStock(event._id, qty));
+      // Liberar solo lo que de verdad se reservó (aforo ilimitado no suma nada)
+      const releaseReservation = () =>
+        releaseTier ? releaseTier() : reservationCounted ? releaseStock(event._id, qty) : undefined;
 
       // Si la orden no llega a crearse, la reserva tampoco puede quedarse.
       let order;
@@ -911,6 +915,7 @@ async function startDirectCheckout(req, res) {
         status: 'created',
         reservedQty: qty,
         reservationActive: true,
+        reservationCounted,
         expiresAt: new Date(Date.now() + RESERVATION_MS),
         clientIp,
         ...(tierSale ? tierOrderFields(tierSale.tier, toCents(unit), qty, event.title) : {}),
@@ -1268,6 +1273,7 @@ router.post('/checkout', anyAuthMw, resolveAppUser, checkoutLimiter, async (req,
 
     // 5b/6) Reserva de stock
     let releaseTier = null;
+    let reservationCounted = true; // las tandas siempre suman (reserveTierStock)
     if (tier) {
       const r = await reserveResolvedTier(event, tier, qty);
       if (!r.ok) {
@@ -1280,8 +1286,8 @@ router.post('/checkout', anyAuthMw, resolveAppUser, checkoutLimiter, async (req,
       }
       releaseTier = r.release;
     } else {
-      const ok = await reserveStock(event._id, qty);
-      if (!ok) {
+      const reserved = await reserveStock(event._id, qty);
+      if (!reserved.ok) {
         const fresh = await Event.findById(event._id)
           .select('capacity ticketsSold ticketsReserved')
           .lean();
@@ -1296,10 +1302,13 @@ router.post('/checkout', anyAuthMw, resolveAppUser, checkoutLimiter, async (req,
           nextTier: null,
         });
       }
+      reservationCounted = reserved.counted;
     }
 
-    // A partir de aquí hay una reserva: cualquier fallo debe liberarla UNA vez.
-    const release = () => (releaseTier ? releaseTier() : releaseStock(event._id, qty));
+    // A partir de aquí hay una reserva: cualquier fallo debe liberarla UNA vez
+    // (y solo lo que de verdad se reservó: aforo ilimitado no suma nada).
+    const release = () =>
+      releaseTier ? releaseTier() : reservationCounted ? releaseStock(event._id, qty) : undefined;
 
     const ticketTheme = resolveTicketTheme({ event, club });
 
@@ -1352,6 +1361,7 @@ router.post('/checkout', anyAuthMw, resolveAppUser, checkoutLimiter, async (req,
         status: 'pending',
         reservedQty: qty,
         reservationActive: true,
+        reservationCounted,
         expiresAt: new Date(Date.now() + RESERVATION_MS),
       });
     } catch (orderErr) {

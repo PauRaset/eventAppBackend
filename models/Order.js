@@ -58,6 +58,12 @@ const OrderSchema = new mongoose.Schema(
     /* -------- Reserva de stock -------- */
     reservedQty:       { type: Number,  default: 0 },
     reservationActive: { type: Boolean, default: false },
+    // ¿Sumó de verdad la reserva a Event.ticketsReserved? Con aforo ilimitado
+    // (capacity 0) reserveStock no suma nada; si luego el club pone aforo,
+    // liberar esa orden restaría reservas de OTROS. Solo se resta si es true.
+    // null (órdenes anteriores al campo) = como antes: se trata como true.
+    // Las órdenes de tanda siempre suman (reserveTierStock).
+    reservationCounted: { type: Boolean, default: null },
     expiresAt:         { type: Date,    default: null, index: true },
     // IP de quien inició la compra web (/direct, sin login): tope de entradas
     // reservadas a la vez por IP y evento.

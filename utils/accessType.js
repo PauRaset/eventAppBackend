@@ -33,9 +33,10 @@ function deriveAccessType(event) {
  * { error, message }.
  *  - paid: necesita precio > 0 (o tandas de pago)
  *  - free_open / free_limited: sin precio ni tandas de pago
+ *  - free_limited: aforo (capacity > 0) y SIN tandas: una sola forma de definirlo
  * (free_open con tandas a 0 € es válido: las tandas no se usan, no hay entradas)
  */
-function validateAccessType(accessType, { price, ticketTiers } = {}) {
+function validateAccessType(accessType, { price, ticketTiers, capacity } = {}) {
   if (!ACCESS_TYPES.includes(accessType)) {
     return {
       error: 'invalid_access_type',
@@ -49,6 +50,18 @@ function validateAccessType(accessType, { price, ticketTiers } = {}) {
   }
   if (accessType !== 'paid' && paid) {
     return { error: 'free_event_with_price', message: 'Un evento gratuito no puede tener precio ni tandas de pago' };
+  }
+  if (accessType === 'free_limited') {
+    if (Array.isArray(ticketTiers) && ticketTiers.length) {
+      return {
+        error: 'free_limited_no_tiers',
+        message: 'Un evento gratis con aforo no usa tandas: quítalas e indica el aforo',
+      };
+    }
+    const cap = Number(capacity);
+    if (!Number.isInteger(cap) || cap <= 0) {
+      return { error: 'free_limited_requires_capacity', message: 'Un evento gratis con aforo necesita un aforo mayor que 0' };
+    }
   }
   return null;
 }

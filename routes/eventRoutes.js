@@ -35,13 +35,41 @@ const { accessInfo, validateAccessType, deriveAccessType } = require("../utils/a
  *    sigue siendo coherente; si no, se deduce del precio (paid / free_open).
  * Devuelve { accessType } o { problem: { error, message } }.
  */
+/**
+ * Aforo (Event.capacity) que llega del cliente. Entero >= 0; 0 = sin límite.
+ * undefined -> no viene; null o "" -> 0 (sin límite).
+ * Devuelve { value } o { problem }.
+ */
+function parseCapacityInput(v) {
+  if (v === undefined) return { value: undefined };
+  if (v === null || (typeof v === "string" && v.trim() === "")) return { value: 0 };
+  const n = Number(v);
+  if (!Number.isInteger(n) || n < 0) {
+    return {
+      problem: {
+        error: "invalid_capacity",
+        message: "El aforo debe ser un número entero mayor o igual que 0 (0 = sin límite)",
+      },
+    };
+  }
+  return { value: n };
+}
+
 function resolveAccessTypeForSave(requested, finalState, currentType = null) {
   if (requested !== undefined && requested !== null && String(requested).trim() !== "") {
     const t = String(requested).trim();
     const problem = validateAccessType(t, finalState);
     return problem ? { problem } : { accessType: t };
   }
-  if (currentType && !validateAccessType(currentType, finalState)) return { accessType: currentType };
+  if (currentType) {
+    const problem = validateAccessType(currentType, finalState);
+    if (!problem) return { accessType: currentType };
+    // Un free_limited que se queda sin aforo o con tandas es un error del
+    // cliente: no se convierte en silencio a free_open.
+    if (problem.error === "free_limited_requires_capacity" || problem.error === "free_limited_no_tiers") {
+      return { problem };
+    }
+  }
   return { accessType: deriveAccessType(finalState) };
 }
 
@@ -1652,10 +1680,16 @@ router.post("/", anyAuth, ensureUserId, upload.single("image"), async (req, res)
       syncEventPrice(newEvent);
     }
 
+    // Aforo (0 = sin límite). Antes esta ruta no lo leía: todo evento nacía ilimitado.
+    const cap = parseCapacityInput(req.body.capacity);
+    if (cap.problem) return res.status(400).json(cap.problem);
+    newEvent.capacity = cap.value ?? 0;
+
     // Tipo de acceso (gratis libre / gratis con aforo / de pago)
     const access = resolveAccessTypeForSave(req.body.accessType, {
       price: newEvent.price,
       ticketTiers: newEvent.ticketTiers,
+      capacity: newEvent.capacity,
     });
     if (access.problem) return res.status(400).json(access.problem);
     newEvent.accessType = access.accessType;
@@ -1890,6 +1924,7 @@ router.get("/map", optionalUserId, async (req, res) => {
       clubId: 1,
       attendees: 1, // solo para contar, no se devuelve
       accessType: 1,
+      capacity: 1, // free_limited exige aforo: sin él, accessInfo no lo daría por válido
       "ticketTiers.priceEUR": 1, // solo para el tipo de acceso de eventos sin migrar
     };
 
@@ -4222,7 +4257,33 @@ async function updateEventHandler(req, res) {
       }
     }
 
-    // Tipo de acceso, con el precio y las tandas como quedarán tras guardar.
+    // Aforo: entero >= 0 y nunca por debajo de lo ya comprometido (vendidas +
+    // reservadas), como las tandas. Bloqueo optimista: si una compra entra
+    // entre la lectura y la escritura y ya no cabe, no se guarda (409).
+    delete update.capacity;
+    if (req.body.capacity !== undefined) {
+      const cap = parseCapacityInput(req.body.capacity);
+      if (cap.problem) return res.status(400).json(cap.problem);
+      const committed = (event.ticketsSold || 0) + (event.ticketsReserved || 0);
+      if (cap.value > 0 && cap.value < committed) {
+        return res.status(400).json({
+          error: "capacity_below_committed",
+          committed,
+          message: `El aforo no puede ser menor que las entradas ya vendidas o reservadas (${committed})`,
+        });
+      }
+      update.capacity = cap.value;
+      if (cap.value > 0) {
+        updateFilter.$expr = {
+          $lte: [
+            { $add: [{ $ifNull: ["$ticketsSold", 0] }, { $ifNull: ["$ticketsReserved", 0] }] },
+            cap.value,
+          ],
+        };
+      }
+    }
+
+    // Tipo de acceso, con el precio, las tandas y el aforo como quedarán tras guardar.
     // (findOneAndUpdate no pasa los validadores del esquema: se valida aquí.)
     delete update.accessType;
     const access = resolveAccessTypeForSave(
@@ -4230,6 +4291,7 @@ async function updateEventHandler(req, res) {
       {
         price: update.price !== undefined ? update.price : event.price,
         ticketTiers: update.ticketTiers !== undefined ? update.ticketTiers : event.ticketTiers,
+        capacity: update.capacity !== undefined ? update.capacity : event.capacity,
       },
       event.accessType
     );

@@ -67,7 +67,7 @@ async function main() {
 
   // Lectura en bruto: el modelo aplicaría el defecto 'free_open' a los que no lo tienen.
   const events = await Event.collection
-    .find({}, { projection: { title: 1, price: 1, ticketTiers: 1, accessType: 1, startAt: 1, date: 1 } })
+    .find({}, { projection: { title: 1, price: 1, ticketTiers: 1, accessType: 1, capacity: 1, startAt: 1, date: 1 } })
     .toArray();
 
   const groups = { paid: [], free_open: [] };
@@ -130,9 +130,15 @@ async function main() {
   }
   const freeWithTiers = groups.free_open.filter((e) => Array.isArray(e.ticketTiers) && e.ticketTiers.length);
   if (freeWithTiers.length) {
-    console.log(`\nℹ️ ${freeWithTiers.length} evento(s) quedan 'free_open' pero tienen tandas a 0 € (con cupo):`);
-    console.log("   revisa si deberían ser 'free_limited' (gratis con aforo); eso lo decide el club:");
-    show(freeWithTiers);
+    console.log(`\nℹ️ ${freeWithTiers.length} evento(s) quedan 'free_open' pero tienen tandas a 0 € (con cupo).`);
+    console.log("   Si son eventos gratis con aforo, conviértelos: quita la tanda y pon su cupo como AFORO");
+    console.log("   del evento ('free_limited' no admite tandas). Aforo sugerido = suma de las cantidades:");
+    show(freeWithTiers, (e) => {
+      const quantities = (e.ticketTiers || []).map((t) => Number(t.quantity) || 0);
+      const unlimited = quantities.some((q) => q <= 0);
+      const sum = quantities.reduce((a, q) => a + q, 0);
+      return line(e, unlimited ? "aforo sugerido: (alguna tanda es ilimitada)" : `aforo sugerido: ${sum}`);
+    });
   }
   if (mixed.length) {
     console.log(`\n⚠️ ${mixed.length} evento(s) MEZCLAN tandas gratis y de pago (quedan como 'paid').`);

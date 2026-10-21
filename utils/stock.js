@@ -5,14 +5,17 @@ const Order = require('../models/Order');
 const { syncEventPrice } = require('./tiers');
 
 /**
- * Reserva qty entradas de forma atómica.
- * Devuelve true si se pudo reservar, false si no hay stock.
- * capacity <= 0 significa aforo ilimitado: no se reserva nada.
+ * Reserva qty entradas de forma atómica (eventos SIN tandas).
+ * Devuelve { ok: false } si no hay stock, o { ok: true, counted }:
+ *  - counted true:  sumó qty a ticketsReserved (evento con aforo)
+ *  - counted false: aforo ilimitado (capacity <= 0), no se reservó nada
+ * Guarda `counted` en la orden (Order.reservationCounted): al liberarla solo
+ * se resta si sumó (releaseOrderStock / commitStock).
  */
 async function reserveStock(eventId, qty) {
   const evt = await Event.findById(eventId).select('capacity').lean();
-  if (!evt) return false;
-  if (!evt.capacity || evt.capacity <= 0) return true; // sin límite
+  if (!evt) return { ok: false };
+  if (!evt.capacity || evt.capacity <= 0) return { ok: true, counted: false }; // sin límite
 
   const updated = await Event.findOneAndUpdate(
     {
@@ -27,7 +30,7 @@ async function reserveStock(eventId, qty) {
     { $inc: { ticketsReserved: qty } },
     { new: true }
   );
-  return !!updated;
+  return updated ? { ok: true, counted: true } : { ok: false };
 }
 
 /** Libera una reserva (por caducidad o error). Nunca deja el contador negativo. */
@@ -39,11 +42,31 @@ async function releaseStock(eventId, qty) {
   );
 }
 
-/** Convierte una reserva en venta confirmada. */
-async function commitStock(eventId, qty) {
+/**
+ * Convierte una reserva en venta confirmada. `counted: false` (la reserva no
+ * sumó a ticketsReserved: aforo ilimitado al reservar) -> solo suma la venta.
+ */
+async function commitStock(eventId, qty, { counted = true } = {}) {
   if (!qty || qty <= 0) return;
   await Event.updateOne({ _id: eventId }, { $inc: { ticketsSold: qty } });
-  await releaseStock(eventId, qty);
+  if (counted) await releaseStock(eventId, qty);
+}
+
+/** ¿Sumó la reserva de esta orden a ticketsReserved? null (órdenes antiguas) = sí. */
+function orderReservationCounted(order) {
+  return !!order && order.reservationCounted !== false;
+}
+
+/**
+ * Libera la reserva de una orden con la función que le toca: tanda ->
+ * releaseTierStock; sin tanda -> releaseStock, solo si de verdad sumó.
+ * La orden debe estar ya reclamada (reservationActive -> false) por quien llama.
+ */
+async function releaseOrderStock(order) {
+  const qty = order?.reservedQty || 0;
+  if (!qty) return;
+  if (order.tierId) return releaseTierStock(order.eventId, order.tierId, qty);
+  if (orderReservationCounted(order)) return releaseStock(order.eventId, qty);
 }
 
 /**
@@ -73,11 +96,7 @@ async function sweepExpiredReservations() {
       // Cada orden con SU función: las de tanda bajan ticketTiers[].reserved y
       // ticketsReserved. Antes se usaba releaseStock para todas, y en las de
       // tanda el reservado de la tanda se quedaba bloqueado para siempre.
-      if (claimed.tierId) {
-        await releaseTierStock(claimed.eventId, claimed.tierId, claimed.reservedQty || 0);
-      } else {
-        await releaseStock(claimed.eventId, claimed.reservedQty || 0);
-      }
+      await releaseOrderStock(claimed);
       released++;
     } catch (e) {
       console.error('[stock] sweep fallo en orden', String(o._id), e.message);
@@ -294,8 +313,26 @@ async function commitTierStock(eventId, tierId, qty) {
   await syncPriceFromTiers(eventId);
 }
 
+/**
+ * Venta de una tanda cuya reserva ya se había liberado (la sesión se pagó justo
+ * cuando caducaba y el barrido o el aviso de expiración la soltó antes). El
+ * pago ya está hecho: se cuenta la venta sin mirar el cupo ni tocar reservas.
+ * La usaba el webhook de Stripe pero no existía (TypeError: el pago se quedaba
+ * sin entradas y Stripe reintentaba sin fin).
+ */
+async function addTierSoldWithoutReservation(eventId, tierId, qty) {
+  if (!qty || qty <= 0) return;
+  await Event.updateOne(
+    { _id: eventId, 'ticketTiers.tierId': tierId },
+    { $inc: { 'ticketTiers.$[tier].sold': qty, ticketsSold: qty } },
+    { arrayFilters: [{ 'tier.tierId': tierId }] }
+  );
+  await syncPriceFromTiers(eventId);
+}
+
 module.exports = {
   reserveStock, releaseStock, commitStock, sweepExpiredReservations,
+  releaseOrderStock, orderReservationCounted,
   availableTiers, tierRemaining,
-  reserveTierStock, releaseTierStock, commitTierStock,
+  reserveTierStock, releaseTierStock, commitTierStock, addTierSoldWithoutReservation,
 };

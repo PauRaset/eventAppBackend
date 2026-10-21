@@ -58,7 +58,9 @@ async function loadCandidates(ids) {
 async function loadActiveReservations(eventIds) {
   const now = new Date();
   const rows = await Order.aggregate([
-    { $match: { reservationActive: true, eventId: { $in: eventIds } } },
+    // Las órdenes que reservaron con aforo ilimitado no sumaron al contador
+    // (reservationCounted: false): no son reserva real. null = antiguas, sí.
+    { $match: { reservationActive: true, reservationCounted: { $ne: false }, eventId: { $in: eventIds } } },
     {
       $group: {
         _id: { eventId: "$eventId", tierId: { $ifNull: ["$tierId", null] } },
