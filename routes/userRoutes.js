@@ -9,6 +9,7 @@ const sharp = require("sharp");
 const User = require("../models/User");
 const Event = require("../models/Event");
 const { accessInfo } = require("../utils/accessType");
+const { eventAvailability } = require("../utils/stock");
 const jwt = require("jsonwebtoken");
 const authenticateToken = require("../middlewares/authMiddleware");
 
@@ -181,8 +182,8 @@ router.get("/me/attending", anyAuth, ensureUserId, async (req, res) => {
   try {
     const userId = req.user.id;
     const events = await Event.find({ attendees: userId })
-      // accessType/price/capacity/tandas: para accessInfo
-      .select("title date image createdBy accessType price capacity ticketTiers.priceEUR")
+      // accessType/price/aforo/vendidas/tandas: para accessInfo y eventAvailability
+      .select("title date image createdBy accessType price capacity ticketsSold ticketsReserved ticketTiers salesStart salesEnd")
       .sort({ date: -1 })
       .lean();
 
@@ -192,6 +193,7 @@ router.get("/me/attending", anyAuth, ensureUserId, async (req, res) => {
       date: e.date,
       imageUrl: absUrlFromUpload(req, e.image),
       ...accessInfo(e), // accessType + requiresTicket: qué botón mostrar sin pedir el detalle
+      ...eventAvailability(e), // soldOut + spotsLeft (sin consultas extra)
     }));
 
     res.json(out);
@@ -735,8 +737,8 @@ router.get("/:id/attending", optionalAnyAuth, async (req, res) => {
     }
 
     const events = await Event.find({ attendees: user._id })
-      // accessType/price/capacity/tandas: para accessInfo
-      .select("title date image createdBy accessType price capacity ticketTiers.priceEUR")
+      // accessType/price/aforo/vendidas/tandas: para accessInfo y eventAvailability
+      .select("title date image createdBy accessType price capacity ticketsSold ticketsReserved ticketTiers salesStart salesEnd")
       .sort({ date: -1 })
       .lean();
 
@@ -746,6 +748,7 @@ router.get("/:id/attending", optionalAnyAuth, async (req, res) => {
       date: e.date,
       imageUrl: absUrlFromUpload(req, e.image),
       ...accessInfo(e), // accessType + requiresTicket: qué botón mostrar sin pedir el detalle
+      ...eventAvailability(e), // soldOut + spotsLeft (sin consultas extra)
     }));
 
     return res.json(out);

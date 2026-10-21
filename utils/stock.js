@@ -3,6 +3,7 @@
 const Event = require('../models/Event');
 const Order = require('../models/Order');
 const { syncEventPrice } = require('./tiers');
+const { accessTypeOf } = require('./accessType');
 
 /**
  * Reserva qty entradas de forma atómica (eventos SIN tandas).
@@ -165,6 +166,111 @@ function availableTiers(event) {
 function tierRemaining(tier) {
   if (!tier.quantity || tier.quantity <= 0) return Infinity;
   return Math.max(0, tier.quantity - (tier.sold || 0) - (tier.reserved || 0));
+}
+
+/**
+ * Plazas libres del AFORO del evento: capacity - ticketsSold - ticketsReserved.
+ * Devuelve Infinity si capacity es 0 (sin límite).
+ */
+function capacityRemaining(event) {
+  const cap = Number(event?.capacity) || 0;
+  if (cap <= 0) return Infinity;
+  return Math.max(0, cap - (event.ticketsSold || 0) - (event.ticketsReserved || 0));
+}
+
+/**
+ * Disponibilidad del evento para la app (sin pedir /tiers):
+ *   { soldOut, spotsLeft, availability, salesStartAt }
+ *  - spotsLeft null = sin límite.
+ *  - availability: 'available' | 'sold_out' | 'not_yet_on_sale' | 'sales_ended'
+ *    (el motivo: "A la venta el jueves" no es "Agotado").
+ *  - salesStartAt: cuándo empieza la venta si aún no ha empezado; si no, null.
+ * Sale SOLO de campos del propio evento (capacity, ticketsSold,
+ * ticketsReserved, ticketTiers, salesStart/salesEnd): ninguna consulta extra.
+ *  - free_open:    sin aforo ni venta -> available, { false, null }
+ *  - free_limited: aforo del evento
+ *  - paid con tandas: suma de lo que queda en las tandas comprables AHORA
+ *    (availableTiers: activas, en su ventana de venta y con unidades), null si
+ *    alguna es ilimitada; sin ninguna comprable -> soldOut. Si el evento tiene
+ *    además aforo, manda el menor de los dos (reserveTierStock exige ambos).
+ *  - paid sin tandas: aforo del evento (capacity 0 -> sin límite)
+ * soldOut/spotsLeft no cambian por availability (compatibilidad): una tanda
+ * que aún no se vende sigue dando soldOut true, pero con 'not_yet_on_sale'.
+ * Mismo criterio que la compra (hasActiveTiers / reserveStock / reserveTierStock
+ * y las ventanas salesStart/salesEnd del evento).
+ */
+function eventAvailability(event, now = new Date()) {
+  const type = accessTypeOf(event);
+  if (type === 'free_open') {
+    return { soldOut: false, spotsLeft: null, availability: 'available', salesStartAt: null };
+  }
+
+  const capLeft = capacityRemaining(event);
+  const hasActiveTiers = (event.ticketTiers || []).some((t) => t && t.active !== false);
+
+  let soldOut;
+  let spotsLeft;
+  let reason = null; // motivo cuando no hay nada comprable por las tandas
+  let tierStart = null;
+
+  let left = capLeft;
+  if (type === 'paid' && hasActiveTiers) {
+    const sellable = availableTiers(event);
+    if (!sellable.length) {
+      // ¿Por qué no hay ninguna comprable? Entre las activas que aún tienen
+      // unidades: alguna empieza más tarde -> aún no a la venta (la más
+      // próxima); si no, alguna ya cerró su venta -> venta terminada; si no,
+      // agotado.
+      const withUnits = (event.ticketTiers || []).filter((t) => t && t.active && tierRemaining(t) !== 0);
+      const upcoming = withUnits
+        .map((t) => (t.salesStart ? new Date(t.salesStart) : null))
+        .filter((d) => d && d > now)
+        .sort((a, b) => a - b);
+      if (upcoming.length) {
+        reason = 'not_yet_on_sale';
+        tierStart = upcoming[0];
+      } else if (withUnits.some((t) => t.salesEnd && new Date(t.salesEnd) < now)) {
+        reason = 'sales_ended';
+      } else {
+        reason = 'sold_out';
+      }
+      left = 0;
+    } else {
+      const tiersLeft = sellable.reduce((sum, t) => sum + tierRemaining(t), 0); // Infinity si alguna es ilimitada
+      left = Math.min(tiersLeft, capLeft);
+    }
+  }
+
+  if (left === Infinity) {
+    soldOut = false;
+    spotsLeft = null;
+  } else {
+    soldOut = left <= 0;
+    spotsLeft = Math.max(0, left);
+  }
+
+  // Motivo: primero la ventana de venta del EVENTO, después la de las tandas
+  let availability;
+  let salesStartAt = null;
+  const eventStart = event.salesStart ? new Date(event.salesStart) : null;
+  if (eventStart && eventStart > now) {
+    availability = 'not_yet_on_sale';
+    salesStartAt = eventStart;
+  } else if (event.salesEnd && new Date(event.salesEnd) < now) {
+    availability = 'sales_ended';
+  } else if (reason) {
+    availability = reason;
+    salesStartAt = tierStart;
+  } else {
+    availability = soldOut ? 'sold_out' : 'available';
+  }
+
+  return {
+    soldOut,
+    spotsLeft,
+    availability,
+    salesStartAt: salesStartAt ? salesStartAt.toISOString() : null,
+  };
 }
 
 /**
@@ -368,6 +474,6 @@ module.exports = {
   reserveStock, releaseStock, commitStock, sweepExpiredReservations,
   releaseOrderStock, orderReservationCounted,
   sellStockDirect, releaseSoldStock,
-  availableTiers, tierRemaining,
+  availableTiers, tierRemaining, capacityRemaining, eventAvailability,
   reserveTierStock, releaseTierStock, commitTierStock, addTierSoldWithoutReservation,
 };

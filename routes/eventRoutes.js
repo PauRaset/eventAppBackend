@@ -28,7 +28,13 @@ const { geocodeAddress, applyGeo, buildAddress } = require("../utils/geocode");
 const { sanitizeTiers, validateTierChanges, syncEventPrice } = require("../utils/tiers");
 const { accessInfo, accessTypeOf, validateAccessType, deriveAccessType } = require("../utils/accessType");
 const { issueTicketsForOrder, sendOrderTicketsEmail } = require("../utils/ticketIssuing");
-const { sellStockDirect, releaseSoldStock } = require("../utils/stock");
+const {
+  sellStockDirect,
+  releaseSoldStock,
+  tierRemaining,
+  capacityRemaining,
+  eventAvailability,
+} = require("../utils/stock");
 
 /**
  * accessType a guardar al crear/editar un evento, con precio y tandas FINALES.
@@ -1700,6 +1706,7 @@ router.post("/", anyAuth, ensureUserId, upload.single("image"), async (req, res)
     res.status(201).json({
       ...savedEvent.toObject(),
       ...accessInfo(savedEvent),
+      ...eventAvailability(savedEvent), // soldOut + spotsLeft (sin consultas extra)
       qrPayload: `NV_EVENT:${savedEvent._id}:${savedEvent.qrToken}`,
     });
   } catch (error) {
@@ -1748,6 +1755,7 @@ router.get("/mine", anyAuth, ensureUserId, async (req, res) => {
         ...event,
         imageUrl: absUrlFromUpload(req, event.image),
         ...accessInfo(event), // accessType + requiresTicket (la app no interpreta precios)
+        ...eventAvailability(event), // soldOut + spotsLeft (sin consultas extra)
         photos,
         createdBy: event.createdBy
           ? {
@@ -1788,6 +1796,7 @@ router.get("/", optionalUserId, async (req, res) => {
         ...event,
         imageUrl: absUrlFromUpload(req, event.image),
         ...accessInfo(event), // accessType + requiresTicket (la app no interpreta precios)
+        ...eventAvailability(event), // soldOut + spotsLeft (sin consultas extra)
         photos,
         createdBy: event.createdBy
           ? {
@@ -1854,6 +1863,7 @@ router.get("/search", optionalUserId, async (req, res) => {
         ...event,
         imageUrl: absUrlFromUpload(req, event.image),
         ...accessInfo(event), // accessType + requiresTicket (la app no interpreta precios)
+        ...eventAvailability(event), // soldOut + spotsLeft (sin consultas extra)
         photos,
         createdBy: event.createdBy
           ? {
@@ -1927,7 +1937,12 @@ router.get("/map", optionalUserId, async (req, res) => {
       attendees: 1, // solo para contar, no se devuelve
       accessType: 1,
       capacity: 1, // free_limited exige aforo: sin él, accessInfo no lo daría por válido
-      "ticketTiers.priceEUR": 1, // solo para el tipo de acceso de eventos sin migrar
+      // Disponibilidad (eventAvailability) y tipo de acceso: todo del propio evento
+      ticketsSold: 1,
+      ticketsReserved: 1,
+      ticketTiers: 1,
+      salesStart: 1, // availability: "aún no a la venta" / "venta terminada"
+      salesEnd: 1,
     };
 
     const events = await Event.find(filter, projection).lean();
@@ -1950,6 +1965,7 @@ router.get("/map", optionalUserId, async (req, res) => {
       clubId: e.clubId,
       attendeesCount: Array.isArray(e.attendees) ? e.attendees.length : 0,
       ...accessInfo(e),
+      ...eventAvailability(e), // soldOut + spotsLeft (sin consultas extra)
     }));
 
     return res.json(result);
@@ -2924,7 +2940,7 @@ router.get("/:id/tiers", optionalUserId, async (req, res) => {
 
     const event = await Event.findById(id)
       .select(
-        "_id price capacity ticketsSold ticketsReserved ticketTiers currency platformFeeEUR accessType"
+        "_id price capacity ticketsSold ticketsReserved ticketTiers currency platformFeeEUR accessType salesStart salesEnd"
       )
       .lean();
 
@@ -2948,10 +2964,7 @@ router.get("/:id/tiers", optionalUserId, async (req, res) => {
       const seenNames = new Set();
 
       tiers = sorted.map((tier) => {
-        const rem =
-          !tier.quantity || tier.quantity <= 0
-            ? Infinity
-            : Math.max(0, tier.quantity - (tier.sold || 0) - (tier.reserved || 0));
+        const rem = tierRemaining(tier); // Infinity = ilimitada (utils/stock.js)
 
         const remaining = rem === Infinity ? null : rem;
         const soldOut = remaining !== null && remaining <= 0;
@@ -2976,11 +2989,7 @@ router.get("/:id/tiers", optionalUserId, async (req, res) => {
       });
     } else {
       // Tier sintético a partir de price/capacity legacy
-      const committed = (event.ticketsSold || 0) + (event.ticketsReserved || 0);
-      const rem =
-        event.capacity > 0
-          ? Math.max(0, event.capacity - committed)
-          : Infinity;
+      const rem = capacityRemaining(event); // Infinity = sin aforo (utils/stock.js)
       const remaining = rem === Infinity ? null : rem;
       const soldOut = remaining !== null && remaining <= 0;
 
@@ -3001,6 +3010,7 @@ router.get("/:id/tiers", optionalUserId, async (req, res) => {
     return res.json({
       eventId:       String(event._id),
       ...accessInfo(event),
+      ...eventAvailability(event), // soldOut + spotsLeft del evento entero
       hasTiers,
       tiers,
       currency:      event.currency || "eur",
@@ -3180,6 +3190,7 @@ router.get("/:id", optionalUserId, async (req, res) => {
       ...obj,
       imageUrl: absUrlFromUpload(req, obj.image),
       ...accessInfo(obj), // accessType + requiresTicket (la app no interpreta precios)
+      ...eventAvailability(obj), // soldOut + spotsLeft (sin consultas extra)
       photos: approvedOnly(obj.photos).map((p) => toPhotoTileAbs(req, p, req.user?.id || null)).filter(Boolean),
       createdBy: obj.createdBy
         ? {
@@ -4547,6 +4558,7 @@ async function updateEventHandler(req, res) {
       ...updated,
       imageUrl: absUrlFromUpload(req, updated.image),
       ...accessInfo(updated), // accessType + requiresTicket (la app no interpreta precios)
+      ...eventAvailability(updated), // soldOut + spotsLeft (sin consultas extra)
       photos: approvedOnly(updated.photos).map((p) => toPhotoTileAbs(req, p, req.user?.id || null)).filter(Boolean),
       createdBy: updated.createdBy
         ? {
