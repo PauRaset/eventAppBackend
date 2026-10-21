@@ -8,6 +8,7 @@ const sharp = require("sharp");
 
 const User = require("../models/User");
 const Event = require("../models/Event");
+const { accessInfo } = require("../utils/accessType");
 const jwt = require("jsonwebtoken");
 const authenticateToken = require("../middlewares/authMiddleware");
 
@@ -180,7 +181,8 @@ router.get("/me/attending", anyAuth, ensureUserId, async (req, res) => {
   try {
     const userId = req.user.id;
     const events = await Event.find({ attendees: userId })
-      .select("title date image createdBy")
+      // accessType/price/capacity/tandas: para accessInfo
+      .select("title date image createdBy accessType price capacity ticketTiers.priceEUR")
       .sort({ date: -1 })
       .lean();
 
@@ -189,6 +191,7 @@ router.get("/me/attending", anyAuth, ensureUserId, async (req, res) => {
       title: e.title,
       date: e.date,
       imageUrl: absUrlFromUpload(req, e.image),
+      ...accessInfo(e), // accessType + requiresTicket: qué botón mostrar sin pedir el detalle
     }));
 
     res.json(out);
@@ -732,7 +735,8 @@ router.get("/:id/attending", optionalAnyAuth, async (req, res) => {
     }
 
     const events = await Event.find({ attendees: user._id })
-      .select("title date image createdBy")
+      // accessType/price/capacity/tandas: para accessInfo
+      .select("title date image createdBy accessType price capacity ticketTiers.priceEUR")
       .sort({ date: -1 })
       .lean();
 
@@ -741,6 +745,7 @@ router.get("/:id/attending", optionalAnyAuth, async (req, res) => {
       title: e.title,
       date: e.date,
       imageUrl: absUrlFromUpload(req, e.image),
+      ...accessInfo(e), // accessType + requiresTicket: qué botón mostrar sin pedir el detalle
     }));
 
     return res.json(out);

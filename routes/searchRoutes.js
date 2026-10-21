@@ -4,6 +4,7 @@ const rateLimit = require("express-rate-limit");
 const router = express.Router();
 const User = require("../models/User");
 const Event = require("../models/Event");
+const { accessInfo } = require("../utils/accessType");
 const { anyAuthWithId } = require("../middlewares/authMiddleware");
 
 // 30 búsquedas de usuarios por minuto por usuario autenticado (va DESPUÉS de anyAuthWithId)
@@ -114,7 +115,8 @@ router.get("/events", async (req, res) => {
     const [total, items] = await Promise.all([
       Event.countDocuments(filter),
       Event.find(filter)
-        .select("title date city street image categories createdBy attendees")
+        // accessType/price/capacity/tandas: para accessInfo
+        .select("title date city street image categories createdBy attendees accessType price capacity ticketTiers.priceEUR")
         .populate("createdBy", "username profilePicture")
         .sort({ date: 1 })
         .skip(skip)
@@ -123,7 +125,8 @@ router.get("/events", async (req, res) => {
     ]);
 
     res.json({
-      items,
+      // accessType + requiresTicket: qué botón mostrar sin pedir el detalle
+      items: items.map((e) => ({ ...e, ...accessInfo(e) })),
       total,
       page,
       pageSize,

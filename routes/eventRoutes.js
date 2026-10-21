@@ -2432,10 +2432,11 @@ router.get("/my-tickets/full", anyAuth, ensureUserId, async (req, res) => {
 
     const [events, orders] = await Promise.all([
       Event.find({ _id: { $in: eventIds } })
-        .select("_id title image startAt endAt date city street ticketTiers.tierId ticketTiers.name ticketTiers.priceEUR club createdBy")
+        // accessType/price/capacity: para accessInfo (tipo de acceso del evento)
+        .select("_id title image startAt endAt date city street ticketTiers.tierId ticketTiers.name ticketTiers.priceEUR club createdBy accessType price capacity")
         .lean(),
       Order.find({ _id: { $in: orderIds } })
-        .select("_id amountEUR currency qty tierName items.ticketTypeId items.unitAmount")
+        .select("_id amountEUR currency qty tierName items.ticketTypeId items.unitAmount freeReservation status")
         .lean(),
     ]);
     const eventById = new Map(events.map((e) => [String(e._id), e]));
@@ -2504,8 +2505,16 @@ router.get("/my-tickets/full", anyAuth, ensureUserId, async (req, res) => {
               startAt: ev.startAt || ev.date || null,
               city: ev.city || "",
               street: ev.street || "",
+              ...accessInfo(ev), // accessType + requiresTicket
             }
           : null,
+        // Reserva gratuita (POST /:id/reserve). Mejor señal que event.accessType
+        // para el botón: el tipo del evento podría cambiar después de reservar.
+        freeReservation: !!ord?.freeReservation,
+        // "Cancelar reserva": solo quien reservó, mientras la reserva siga activa
+        // y la entrada no se haya usado en la puerta (DELETE /:id/reserve).
+        canCancelReservation:
+          isOwnerRole && !!ord?.freeReservation && ord.status === "paid" && t.status === "issued",
         club: clubName ? { name: clubName } : null,
         // amountEUR es el total de la orden (qty entradas), sin la comisión.
         // unitAmountEUR es el precio de ESTA entrada.

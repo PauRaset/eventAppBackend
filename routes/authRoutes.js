@@ -5,6 +5,7 @@ const router = express.Router();
 
 const User = require("../models/User");
 const Event = require("../models/Event"); // <- para /me/attending
+const { accessInfo } = require("../utils/accessType");
 const multer = require("../uploads/multerConfig"); // si lo usas así
 const authController = require("../controllers/authController");
 const {
@@ -457,6 +458,7 @@ router.get("/me/attending", anyAuth, ensureUserId, async (req, res) => {
 
     const formatted = events.map((ev) => ({
       ...ev,
+      ...accessInfo(ev), // accessType + requiresTicket: qué botón mostrar sin pedir el detalle
       categories: Array.isArray(ev.categories)
         ? ev.categories
         : typeof ev.categories === "string"
@@ -489,6 +491,7 @@ router.get("/users/me/attending", anyAuth, ensureUserId, async (req, res) => {
 
     const formatted = events.map((ev) => ({
       ...ev,
+      ...accessInfo(ev), // accessType + requiresTicket: qué botón mostrar sin pedir el detalle
       categories: Array.isArray(ev.categories)
         ? ev.categories
         : typeof ev.categories === "string"
