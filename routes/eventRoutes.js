@@ -4101,11 +4101,6 @@ router.delete("/:id/photos/:pid?", anyAuth, ensureUserId, async (req, res) => {
 });
 
 /* ------------------------------------------------------------------
-   ALTERNAR ASISTENCIA (requiere usuario)
-   - Alterna en Mongo (campo attendees)
-   - Escribe/borra doc en Firestore: attendances/{uid}_{eventId}
-------------------------------------------------------------------- */
-/* ------------------------------------------------------------------
    RESERVA GRATUITA (eventos accessType 'free_limited')
    POST   /api/events/:id/reserve  -> plaza + entrada con QR + email, sin Stripe
    DELETE /api/events/:id/reserve  -> anula la reserva y devuelve la plaza
@@ -4318,35 +4313,58 @@ router.delete("/:id/reserve", anyAuth, ensureUserId, reserveLimiter, async (req,
   }
 });
 
+/* ------------------------------------------------------------------
+   ALTERNAR ASISTENCIA (requiere usuario)
+   - Alterna en Mongo (campo attendees) con operaciones ATÓMICAS: dos toques
+     seguidos o varios usuarios a la vez no chocan ni se pisan. (Antes:
+     leer -> splice/push -> save(); desmarcar daba VersionError si otra
+     petición tocaba el evento, y dos marcados simultáneos metían al usuario
+     dos veces.)
+   - Escribe/borra doc en Firestore: attendances/{uid}_{eventId}
+------------------------------------------------------------------- */
+function updateModified(r) {
+  return Number(r?.nModified ?? r?.modifiedCount ?? 0) > 0;
+}
+
 router.post("/:id/attend", anyAuth, ensureUserId, async (req, res) => {
   const eventId = req.params.id;
 
   try {
-    // 1) Recuperar evento
+    // 1) Recuperar evento (solo lo que usan Firestore y la clave del club)
     if (!mongoose.isValidObjectId(eventId)) {
       return res.status(400).json({ message: "ID de evento inválido" });
     }
-    const event = await Event.findById(eventId);
+    const event = await Event.findById(eventId).select("_id title date image createdBy clubId club").lean();
     if (!event) return res.status(404).json({ message: "Evento no encontrado" });
 
-    event.attendees = Array.isArray(event.attendees) ? event.attendees : [];
-
-    // 2) Usuario (Mongo id ya garantizado)
+    // 2) Usuario (Mongo id ya garantizado). attendees guarda ObjectId.
     const userId = req.user.id;
+    const userObjId = new mongoose.Types.ObjectId(userId);
 
-    // 3) Alternar asistencia en Mongo (comparando como string)
-    const idx = event.attendees.findIndex((a) => a?.toString?.() === userId);
-    let attendedNow = false;
-
-    if (idx !== -1) {
-      event.attendees.splice(idx, 1); // quitar
+    // 3) Alternar asistencia, atómico. El resultado sale de QUÉ operación
+    //    modificó el documento, no de una lectura previa.
+    //    a) Si estaba: desmarcar ($pull quita también duplicados antiguos)
+    const pulled = await Event.updateOne(
+      { _id: eventId, attendees: userObjId },
+      { $pull: { attendees: userObjId } }
+    );
+    let attendedNow;
+    if (updateModified(pulled)) {
       attendedNow = false;
     } else {
-      event.attendees.push(userId); // añadir
-      attendedNow = true;
+      //  b) Si no estaba: marcar ($addToSet: nunca dos veces)
+      const added = await Event.updateOne(
+        { _id: eventId, attendees: { $ne: userObjId } },
+        { $addToSet: { attendees: userObjId } }
+      );
+      attendedNow = updateModified(added) ? true : null; // null: otra petición cambió el estado entre a) y b)
     }
 
-    await event.save();
+    // Estado final real (para la respuesta, y para el caso de carrera entre a) y b))
+    const after = await Event.findById(eventId).select("_id attendees").lean();
+    if (!after) return res.status(404).json({ message: "Evento no encontrado" });
+    const attendees = Array.isArray(after.attendees) ? after.attendees : [];
+    if (attendedNow === null) attendedNow = attendees.some((a) => String(a) === userId);
 
     // 4) Si viene además como Firebase (teléfono), refleja en Firestore
     const firebaseToken = extractIdToken(req);
@@ -4387,10 +4405,10 @@ router.post("/:id/attend", anyAuth, ensureUserId, async (req, res) => {
       await syncPromotionAfterAttend({ userId, clubId, eventId });
     }
 
-    // 5) Responder
+    // 5) Responder (misma forma que antes: _id + lista de asistentes ya actualizada)
     return res.json({
-      _id: event._id,
-      attendees: event.attendees,
+      _id: after._id,
+      attendees,
     });
   } catch (error) {
     console.error("Error al alternar asistencia:", error);
