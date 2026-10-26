@@ -7,14 +7,20 @@
 //
 // Uso:  node scripts/backfillAccumulatedMissions.js [--dry-run] [--verbose] [--club <id>]
 //
-//   --dry-run   calcula y enseña qué cambiaría, sin escribir nada
-//   --verbose   una línea por cada progreso que cambia
+//   --dry-run   SIMULACIÓN: no escribe nada y lista, uno por uno, los usuarios,
+//               clubs, niveles y misiones que cambiarían (completar y revertir)
+//   --verbose   esa misma lista también sin --dry-run
 //   --club <id> solo los progresos de ese club
 //
 // Seguro de relanzar: es idempotente (recalcula, no suma). No crea progresos
-// nuevos, no toca lastActivityAt y solo guarda los que cambian. Una misión ya
-// completada no se deshace. Los niveles bloqueados reciben el contador pero no
-// se completan hasta que el usuario llegue a ellos (canje del premio anterior).
+// nuevos, no toca lastActivityAt y solo guarda los que cambian.
+//  - Niveles con el premio CANJEADO: nunca se tocan.
+//  - attend_event y referred_purchases pueden REVERTIR: si ya no se cumplen
+//    (asistencia desmarcada, reembolso) la misión vuelve a pendiente y, si el
+//    nivel estaba completado sin canjear, vuelve a en curso.
+//  - scan_qr, share_event y link_clicks: una misión completada no se deshace.
+// Los niveles bloqueados reciben el contador pero no se completan hasta que el
+// usuario llegue a ellos (canje del premio anterior).
 require("dotenv").config();
 
 const mongoose = require("mongoose");
@@ -50,13 +56,22 @@ function parseArgs(argv) {
 
 /** Qué ha cambiado entre dos fotos del progreso (snapshotProgress). */
 function diffSnapshots(before, after) {
-  const out = { completedMissions: [], completedLevels: [], counterChanges: 0, levelFrom: null, levelTo: null };
+  const out = {
+    completedMissions: [],
+    revertedMissions: [],
+    completedLevels: [],
+    revertedLevels: [],
+    counterChanges: 0,
+    levelFrom: null,
+    levelTo: null,
+  };
   const beforeLevels = new Map(before.levels.map((l) => [l.levelNumber, l]));
 
   for (const lvl of after.levels) {
     const prevLvl = beforeLevels.get(lvl.levelNumber);
     if (!prevLvl) continue;
     if (prevLvl.status !== "completed" && lvl.status === "completed") out.completedLevels.push(lvl.levelNumber);
+    if (prevLvl.status === "completed" && lvl.status !== "completed") out.revertedLevels.push(lvl.levelNumber);
 
     const prevMissions = new Map(prevLvl.missions.map((m) => [m.missionKey, m]));
     for (const m of lvl.missions) {
@@ -64,6 +79,8 @@ function diffSnapshots(before, after) {
       if (!prev) continue;
       if (prev.status !== "completed" && m.status === "completed") {
         out.completedMissions.push({ level: lvl.levelNumber, type: m.type, current: m.current, target: m.target });
+      } else if (prev.status === "completed" && m.status !== "completed") {
+        out.revertedMissions.push({ level: lvl.levelNumber, type: m.type, from: prev.current, current: m.current, target: m.target });
       } else if (prev.current !== m.current) {
         out.counterChanges++;
       }
@@ -90,8 +107,11 @@ async function main() {
     errors: 0,
     errorReasons: new Map(),
     completedByLevelType: new Map(), // "L2 scan_qr" -> n
+    revertedByLevelType: new Map(),  // "L1 attend_event" -> n
     completedMissions: 0,
+    revertedMissions: 0,
     completedLevels: 0,
+    revertedLevels: 0,
     levelMoves: 0,
     counterOnly: 0, // cambian contadores pero no se completa nada
   };
@@ -124,17 +144,27 @@ async function main() {
       const k = `L${m.level} ${m.type}`;
       s.completedByLevelType.set(k, (s.completedByLevelType.get(k) || 0) + 1);
     }
+    for (const m of d.revertedMissions) {
+      const k = `L${m.level} ${m.type}`;
+      s.revertedByLevelType.set(k, (s.revertedByLevelType.get(k) || 0) + 1);
+    }
     s.completedMissions += d.completedMissions.length;
+    s.revertedMissions += d.revertedMissions.length;
     s.completedLevels += d.completedLevels.length;
+    s.revertedLevels += d.revertedLevels.length;
     if (d.levelFrom !== null) s.levelMoves++;
-    if (!d.completedMissions.length) s.counterOnly++;
+    if (!d.completedMissions.length && !d.revertedMissions.length) s.counterOnly++;
 
-    if (args.verbose) {
+    if (args.verbose || args.dryRun) {
       const parts = [];
       if (d.completedMissions.length) {
         parts.push(`completa ${d.completedMissions.map((m) => `L${m.level} ${m.type} ${m.current}/${m.target}`).join(", ")}`);
       }
+      if (d.revertedMissions.length) {
+        parts.push(`REVIERTE ${d.revertedMissions.map((m) => `L${m.level} ${m.type} ${m.from}->${m.current}/${m.target}`).join(", ")}`);
+      }
       if (d.completedLevels.length) parts.push(`niveles completados: ${d.completedLevels.join(", ")}`);
+      if (d.revertedLevels.length) parts.push(`niveles que vuelven a en curso (premio sin canjear): ${d.revertedLevels.join(", ")}`);
       if (d.levelFrom !== null) parts.push(`nivel actual ${d.levelFrom} -> ${d.levelTo}`);
       if (d.counterChanges) parts.push(`${d.counterChanges} contador(es) actualizados`);
       if (!parts.length) parts.push("contadores informativos (qrScansInClub / attendancesInClub)");
@@ -150,14 +180,18 @@ async function main() {
   console.log(`  sin cambios:                  ${s.unchanged}`);
   console.log(`  con error:                    ${s.errors}`);
   for (const [reason, n] of s.errorReasons) console.log(`    - ${reason}: ${n}`);
-  console.log(`  solo contadores (nada nuevo completado): ${s.counterOnly}`);
+  console.log(`  solo contadores (nada completado ni revertido): ${s.counterOnly}`);
   console.log(`Misiones completadas al aplicar el acumulado: ${s.completedMissions}`);
   const rows = [...s.completedByLevelType.entries()].sort((a, b) => {
     const la = Number(a[0].slice(1, a[0].indexOf(" "))), lb = Number(b[0].slice(1, b[0].indexOf(" ")));
     return la - lb || a[0].localeCompare(b[0]);
   });
   for (const [k, n] of rows) console.log(`    - ${k}: ${n}`);
+  console.log(`Misiones que se REVIERTEN (attend_event / referred_purchases): ${s.revertedMissions}`);
+  const revRows = [...s.revertedByLevelType.entries()].sort((a, b) => a[0].localeCompare(b[0], undefined, { numeric: true }));
+  for (const [k, n] of revRows) console.log(`    - ${k}: ${n}`);
   console.log(`Niveles completados:            ${s.completedLevels}`);
+  console.log(`Niveles que vuelven a en curso: ${s.revertedLevels}`);
   console.log(`Progresos que cambian de nivel actual: ${s.levelMoves}`);
   console.log(
     "\nNota: en niveles BLOQUEADOS solo se actualiza el contador; se completan cuando el usuario\n" +

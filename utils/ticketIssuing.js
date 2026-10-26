@@ -12,7 +12,14 @@ const QRCode = require('qrcode');
 const Order = require('../models/Order');
 const Event = require('../models/Event');
 const Ticket = require('../models/Ticket');
-const sendTicketEmail = require('./sendTicketEmail');
+// sendTicketEmail se carga al enviar (no al cargar el módulo): exige
+// SENDGRID_API_KEY al cargarse, y este módulo lo cargan también scripts que
+// nunca envían emails (p. ej. backfillAccumulatedMissions.js vía eventRoutes).
+let sendTicketEmailFn = null;
+function sendTicketEmail(payload) {
+  if (!sendTicketEmailFn) sendTicketEmailFn = require('./sendTicketEmail');
+  return sendTicketEmailFn(payload);
+}
 const { genSerial, makeToken } = require('./ticketToken');
 const {
   commitStock,

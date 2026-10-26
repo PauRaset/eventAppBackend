@@ -695,7 +695,13 @@ function syncLevelWithTemplate(existingLevel, templateLevel, levelIndex = 0) {
     .sort((a, b) => a.order - b.order);
 
   let nextStatus = existingLevel?.status || (nextLevelNumber === 1 ? 'in_progress' : 'locked');
-  if (isLevelFullyCompleted({ status: nextStatus, missions: nextMissions })) {
+  if (keepCompleted) {
+    // Un nivel con el premio cobrado está superado, sea cual sea el estado de
+    // sus misiones: nunca vuelve a en curso (si no, syncProgressWithTemplates
+    // lo pondría como nivel actual y el usuario volvería a un nivel ya cobrado).
+    // Repara también los que dejó así el fallo anterior de follow_users.
+    nextStatus = 'completed';
+  } else if (isLevelFullyCompleted({ status: nextStatus, missions: nextMissions })) {
     nextStatus = 'completed';
   } else if (nextStatus === 'completed' && !keepCompleted) {
     // Completado pero sin canjear, y una misión ha dejado de estar cumplida
@@ -877,6 +883,10 @@ function syncCounterBasedMissions(progress, userDoc = null) {
 
   for (const level of progress.levels) {
     if (!level || !Array.isArray(level.missions)) continue;
+    // Premio ya cobrado: el nivel queda congelado. Dejar de seguir a alguien
+    // nunca revierte su misión, el nivel ni el premio (antes sí: el usuario
+    // volvía a un nivel ya canjeado y no podía volver a canjearlo).
+    if (level.rewardRedeemed === true) continue;
 
     for (const mission of level.missions) {
       if (!mission || mission.active === false) continue;

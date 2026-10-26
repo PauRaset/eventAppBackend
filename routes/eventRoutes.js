@@ -891,6 +891,12 @@ async function recordQrScan(req, event) {
 const REFERRAL_MISSION_TYPES = new Set(["share_event", "link_clicks", "referred_purchases"]);
 const ACCUMULATED_MISSION_TYPES = new Set([...REFERRAL_MISSION_TYPES, "scan_qr", "attend_event"]);
 
+// Acumuladas que pueden BAJAR y deshacer una misión completada (en niveles
+// cuyo premio aún no se ha canjeado): desmarcar asistencia y reembolsos.
+// scan_qr, share_event y link_clicks nunca bajan (los datos no se borran) y
+// mantienen la regla de que una misión completada ya no se toca.
+const DECREASABLE_MISSION_TYPES = new Set(["attend_event", "referred_purchases"]);
+
 /** uid de Firebase o _id de Mongo -> _id de Mongo (string), o null. */
 async function resolveMongoUserId(key) {
   const k = String(key || "").trim();
@@ -970,20 +976,32 @@ async function computeAccumulatedCounts({ userId, clubKey }) {
 
 /**
  * Aplica los recuentos a las misiones acumuladas de un nivel.
- * Una misión ya COMPLETADA no se toca: un reembolso o desmarcar la asistencia
- * después no deshace un nivel superado. En las no completadas, current baja si
- * el recuento baja. En niveles bloqueados se actualiza current (acumulado) pero
- * no el estado: se completa en cuanto el nivel se desbloquea y se sincroniza.
+ *  - Nivel con el premio CANJEADO: congelado, no se toca nada.
+ *  - attend_event y referred_purchases (DECREASABLE_MISSION_TYPES): se
+ *    recalculan en los dos sentidos; si el recuento baja del objetivo, la
+ *    misión completada vuelve a pendiente.
+ *  - El resto: una misión completada ya no se toca (sus datos no bajan).
+ * En niveles bloqueados se actualiza current (acumulado) pero no se completa:
+ * se completa en cuanto el nivel se desbloquea y se sincroniza.
  */
 function applyAccumulatedCountsToLevel(level, counts) {
+  if (level.rewardRedeemed === true) return; // premio cobrado: nunca se revierte
+
   for (const m of level.missions || []) {
     if (!ACCUMULATED_MISSION_TYPES.has(m.type)) continue;
-    if (m.status === "completed") continue;
+    const decreasable = DECREASABLE_MISSION_TYPES.has(m.type);
+    if (m.status === "completed" && !decreasable) continue;
 
     const target = Number(m.target || 1);
     m.current = Math.min(Number(counts[m.type] || 0), target);
     m.updatedAt = new Date();
-    if (level.status === "locked") continue;
+    if (level.status === "locked") {
+      if (m.status === "completed" && m.current < target) {
+        m.status = "locked";
+        m.completedAt = null;
+      }
+      continue;
+    }
 
     if (m.current >= target) {
       m.status = "completed";
@@ -1066,6 +1084,22 @@ async function syncAccumulatedMissionsOnce({ userId, clubKey, eventId, dryRun = 
   for (const lvl of progress.levels || []) {
     applyAccumulatedCountsToLevel(lvl, counts);
     lvl.progress = computeLevelProgress(lvl);
+  }
+
+  // Vuelta atrás: un nivel completado SIN canjear cuyas misiones ya no se
+  // cumplen (asistencia desmarcada, reembolso) vuelve a en curso y su premio
+  // deja de estar disponible. Un nivel canjeado nunca se toca.
+  for (const lvl of progress.levels || []) {
+    if (lvl.rewardRedeemed === true) continue;
+    if (lvl.status === "completed" && !allMissionsCompleted(lvl)) {
+      lvl.status = "in_progress";
+      lvl.completedAt = null;
+      lvl.progress = computeLevelProgress(lvl);
+      // El nivel actual no puede quedar por encima de uno que vuelve a estar en curso
+      if (Number(lvl.levelNumber) < Number(progress.currentLevel)) {
+        progress.currentLevel = Number(lvl.levelNumber);
+      }
+    }
   }
 
   // Completar niveles y, al desbloquear uno, aplicarle también el acumulado.
