@@ -7,6 +7,7 @@ const PromotionClaim = require('../models/PromotionClaim');
 const Notification = require('../models/Notification');
 const { sendPushNotificationToUser } = require('../utils/sendPushNotification');
 const { getTemplatesForClub: getTemplatesForClubShared } = require('../utils/promotionTemplates');
+const { publicDisplayName } = require('../utils/publicName'); // nombres públicos, nunca del teléfono
 const {
   normalizeRewardType,
   autoRewardTitle,
@@ -158,13 +159,9 @@ async function canManageClub(req, clubId) {
 
 function pickClubName(clubDoc) {
   if (!clubDoc) return 'Tu club';
-  return (
-    clubDoc.username ||
-    clubDoc.name ||
-    clubDoc.displayName ||
-    clubDoc.entityName ||
-    'Tu club'
-  ).toString();
+  // Documento Club: su nombre. Usuario club: nombre público (nunca del teléfono).
+  if (clubDoc.name && !clubDoc.username) return String(clubDoc.name);
+  return publicDisplayName(clubDoc) || 'Tu club';
 }
 
 function pickClubAvatar(clubDoc) {

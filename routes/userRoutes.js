@@ -10,6 +10,14 @@ const User = require("../models/User");
 const Event = require("../models/Event");
 const { accessInfo } = require("../utils/accessType");
 const { eventAvailability } = require("../utils/stock");
+// Nombres públicos: nunca nada derivado del teléfono (utils/publicName.js)
+const {
+  publicUsername,
+  publicDisplayName,
+  publicStoredName,
+  looksPhoneDerived,
+  NOT_PHONE_DERIVED_USERNAME,
+} = require("../utils/publicName");
 const jwt = require("jsonwebtoken");
 const authenticateToken = require("../middlewares/authMiddleware");
 
@@ -225,11 +233,15 @@ router.get("/me/assignable", anyAuth, ensureUserId, async (req, res) => {
     const filter = { _id: { $in: followingIds }, role: { $ne: "club" } };
     const q = (req.query.q || "").toString().trim().replace(/^@/, "").slice(0, 50);
     if (q) {
-      filter.username = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+      // Los usernames sacados del teléfono no se buscan (se mostrarían con alias)
+      filter.$and = [
+        { username: new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i") },
+        NOT_PHONE_DERIVED_USERNAME,
+      ];
     }
 
     const users = await User.find(filter)
-      .select("_id username profilePicture")
+      .select("_id username phoneNumber profilePicture")
       .sort({ username: 1 })
       .limit(limit)
       .lean();
@@ -238,7 +250,7 @@ router.get("/me/assignable", anyAuth, ensureUserId, async (req, res) => {
       ok: true,
       users: users.map((u) => ({
         _id: String(u._id),
-        username: u.username || "",
+        username: publicUsername(u),
         profilePictureUrl: absUrlFromUpload(req, u.profilePicture),
       })),
     });
@@ -417,7 +429,10 @@ function userKeyFilter(id) {
   const key = String(id || "");
   const or = [];
   if (/^[a-fA-F0-9]{24}$/.test(key)) or.push({ _id: key });
-  or.push({ firebaseUid: key }, { username: key });
+  or.push({ firebaseUid: key });
+  // Un username sacado del teléfono ("user_" + 6 dígitos) no sirve para buscar:
+  // permitiría comprobar a quién pertenece un número.
+  if (!looksPhoneDerived(key)) or.push({ username: key });
   return { $or: or };
 }
 
@@ -517,7 +532,7 @@ router.get('/:id/moments', optionalAnyAuth, async (req, res) => {
       'photos.by': target._id,
     })
       .select('title date image createdBy photos')
-      .populate('createdBy', 'username displayName entName profilePicture')
+      .populate('createdBy', 'username displayName entName phoneNumber profilePicture')
       .sort({ date: -1, updatedAt: -1 })
       .lean();
 
@@ -565,8 +580,8 @@ router.get('/:id/moments', optionalAnyAuth, async (req, res) => {
           club: club
             ? {
                 id: String(club._id || ''),
-                username: club.username || club.displayName || club.entName || '',
-                displayName: club.displayName || club.username || club.entName || '',
+                username: publicUsername(club),
+                displayName: publicDisplayName(club),
                 profilePictureUrl: absUrlFromUpload(req, club.profilePicture),
               }
             : null,
@@ -611,8 +626,8 @@ router.get('/:id/club-moments', optionalAnyAuth, async (req, res) => {
       photos: { $exists: true, $ne: [] },
     })
       .select('title date image createdBy photos')
-      .populate('createdBy', 'username displayName entName profilePicture')
-      .populate('photos.by', 'username displayName profilePicture')
+      .populate('createdBy', 'username displayName entName phoneNumber profilePicture')
+      .populate('photos.by', 'username displayName phoneNumber profilePicture')
       .sort({ date: -1, updatedAt: -1 })
       .lean();
 
@@ -659,21 +674,21 @@ router.get('/:id/club-moments', optionalAnyAuth, async (req, res) => {
           },
           club: {
             id: String(club._id || clubId),
-            username: club.username || club.displayName || club.entName || '',
-            displayName: club.displayName || club.username || club.entName || '',
+            username: publicUsername(club),
+            displayName: publicDisplayName(club),
             profilePictureUrl: absUrlFromUpload(req, club.profilePicture),
           },
           uploader: uploader
             ? {
                 id: String(uploader._id || ''),
-                username: uploader.username || uploader.displayName || photo.byUsername || '',
-                displayName: uploader.displayName || uploader.username || photo.byUsername || '',
+                username: publicUsername(uploader),
+                displayName: publicDisplayName(uploader),
                 profilePictureUrl: absUrlFromUpload(req, uploader.profilePicture),
               }
             : {
                 id: photo.by ? String(photo.by) : '',
-                username: photo.byUsername || '',
-                displayName: photo.byUsername || '',
+                username: publicStoredName(photo.byUsername, photo.by) || '',
+                displayName: publicStoredName(photo.byUsername, photo.by) || '',
                 profilePictureUrl: null,
               },
         });
@@ -765,7 +780,8 @@ router.get("/:id", optionalAnyAuth, async (req, res) => {
     const user = await User.findOne(userKeyFilter(id))
       // Incluimos posibles campos sociales si existen (arrays o counters)
       .select(
-        "username displayName profilePicture followers following followersCount followingCount firebaseUid isPrivate privacySettings attendancesVisibility momentsVisibility locationVisibility"
+        // phoneNumber: solo para detectar usernames sacados del teléfono; nunca se devuelve
+        "username displayName phoneNumber profilePicture followers following followersCount followingCount firebaseUid isPrivate privacySettings attendancesVisibility momentsVisibility locationVisibility"
       )
       .lean();
 
@@ -813,8 +829,9 @@ router.get("/:id", optionalAnyAuth, async (req, res) => {
 
     return res.json({
       id: String(user._id || id),
-      username: user.username || "",
-      displayName: user.displayName || "",
+      // El dueño ve su username guardado; los demás, el público (nunca del teléfono)
+      username: isOwner ? user.username || "" : publicUsername(user),
+      displayName: user.displayName ? (isOwner ? user.displayName : publicDisplayName(user)) : "",
       profilePicture: user.profilePicture || null,
       avatarUrl: absUrlFromUpload(req, user.profilePicture),
       followersCount,
@@ -865,13 +882,13 @@ async function findUsersForAvatars(req, rawIds) {
       { firebaseUid: { $in: ids } },
     ],
   })
-    .select("username displayName profilePicture")
+    .select("username displayName phoneNumber profilePicture")
     .lean();
 
   return users.map((u) => ({
     id: String(u._id),
-    username: u.username || "",
-    displayName: u.displayName || "",
+    username: publicUsername(u),
+    displayName: u.displayName ? publicDisplayName(u) : "",
     profilePicture: u.profilePicture || null,
     avatarUrl: absUrlFromUpload(req, u.profilePicture),
   }));

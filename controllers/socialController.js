@@ -4,6 +4,13 @@ const User = require('../models/User');
 const Notification = require('../models/Notification');
 const { sendPushNotificationToUser } = require('../utils/sendPushNotification');
 const UserClubPromotionProgress = require('../models/UserClubPromotionProgress');
+// Nombres públicos: nunca nada derivado del teléfono (utils/publicName.js)
+const {
+  publicUsername,
+  publicDisplayName,
+  sanitizePublicUser,
+  NOT_PHONE_DERIVED_USERNAME,
+} = require('../utils/publicName');
 
 // Helpers
 const oid = (v) => {
@@ -46,15 +53,8 @@ const syncFollowedUsersPromotionCounter = async (userId) => {
   }
 };
 
-const displayNameForUser = (user) => {
-  return (
-    user?.username ||
-    user?.displayName ||
-    user?.entityName ||
-    user?.name ||
-    'Alguien'
-  );
-};
+// Nombre en notificaciones ("X empezó a seguirte"): público, nunca del teléfono
+const displayNameForUser = (user) => (user ? publicUsername(user) : 'Alguien');
 
 const previewImageForUser = (user) => {
   return (
@@ -149,6 +149,58 @@ const clearFollowRequestNotification = async ({ actorId, targetId }) => {
   }
 };
 
+// ———————————————————————————————————————————————————————————————————————
+// Seguimientos: alta y baja con contadores CORRECTOS
+// El $inc va en la MISMA operación que el cambio del array y condicionado a
+// que el cambio ocurra de verdad (filtro: ya estaba / no estaba). Antes el
+// $inc era incondicional: dejar de seguir a quien no seguías restaba 1, y dos
+// "seguir" a la vez sumaban 2. Cada lado se ajusta a su propio array.
+// ———————————————————————————————————————————————————————————————————————
+const wasModified = (r) => Number(r?.nModified ?? r?.modifiedCount ?? 0) > 0;
+
+/** followerId empieza a seguir a followeeId. Devuelve { added } (false si ya lo seguía). */
+const addFollowEdge = async (followerId, followeeId) => {
+  const follower = oid(followerId);
+  const followee = oid(followeeId);
+  const [a, b] = await Promise.all([
+    User.updateOne(
+      { _id: follower, following: { $ne: followee } },
+      { $addToSet: { following: followee }, $inc: { followingCount: 1 } }
+    ),
+    User.updateOne(
+      { _id: followee, followers: { $ne: follower } },
+      { $addToSet: { followers: follower }, $inc: { followersCount: 1 } }
+    ),
+  ]);
+  // La solicitud pendiente (si la había) deja de estarlo
+  await Promise.all([
+    User.updateOne({ _id: follower }, { $pull: { followRequestsSent: followee } }),
+    User.updateOne({ _id: followee }, { $pull: { followRequestsReceived: follower } }),
+  ]);
+  return { added: wasModified(a) || wasModified(b) };
+};
+
+/** followerId deja de seguir a followeeId. Devuelve { removed } (false si no lo seguía). */
+const removeFollowEdge = async (followerId, followeeId) => {
+  const follower = oid(followerId);
+  const followee = oid(followeeId);
+  const [a, b] = await Promise.all([
+    User.updateOne(
+      { _id: follower, following: followee },
+      { $pull: { following: followee }, $inc: { followingCount: -1 } }
+    ),
+    User.updateOne(
+      { _id: followee, followers: follower },
+      { $pull: { followers: follower }, $inc: { followersCount: -1 } }
+    ),
+  ]);
+  await Promise.all([
+    User.updateOne({ _id: follower }, { $pull: { followRequestsSent: followee } }),
+    User.updateOne({ _id: followee }, { $pull: { followRequestsReceived: follower } }),
+  ]);
+  return { removed: wasModified(a) || wasModified(b) };
+};
+
 // Safe resolve user by key (either ObjectId or firebaseUid)
 const resolveUserByKey = async (key) => {
   if (!key) return null;
@@ -200,28 +252,7 @@ exports.toggleFollow = async (req, res) => {
 
     // Si ya lo sigo, toggle = unfollow.
     if (already) {
-      await Promise.all([
-        User.updateOne(
-          { _id: oid(me._id) },
-          {
-            $pull: {
-              following: oid(target._id),
-              followRequestsSent: oid(target._id),
-            },
-            $inc: { followingCount: -1 },
-          }
-        ),
-        User.updateOne(
-          { _id: oid(target._id) },
-          {
-            $pull: {
-              followers: oid(me._id),
-              followRequestsReceived: oid(me._id),
-            },
-            $inc: { followersCount: -1 },
-          }
-        ),
-      ]);
+      await removeFollowEdge(me._id, target._id);
 
       await syncFollowedUsersPromotionCounter(me._id);
 
@@ -291,10 +322,7 @@ exports.toggleFollow = async (req, res) => {
     }
 
     // Perfil público: follow directo.
-    await Promise.all([
-      User.updateOne({ _id: oid(me._id) }, { $addToSet: { following: oid(target._id) }, $pull: { followRequestsSent: oid(target._id) }, $inc: { followingCount: 1 } }),
-      User.updateOne({ _id: oid(target._id) }, { $addToSet: { followers: oid(me._id) }, $pull: { followRequestsReceived: oid(me._id) }, $inc: { followersCount: 1 } }),
-    ]);
+    await addFollowEdge(me._id, target._id);
 
     await Promise.all([
       syncFollowedUsersPromotionCounter(me._id),
@@ -389,10 +417,7 @@ exports.followUser = async (req, res) => {
       });
     }
 
-    await Promise.all([
-      User.updateOne({ _id: oid(me._id) }, { $addToSet: { following: oid(target._id) }, $pull: { followRequestsSent: oid(target._id) }, $inc: { followingCount: 1 } }),
-      User.updateOne({ _id: oid(target._id) }, { $addToSet: { followers: oid(me._id) }, $pull: { followRequestsReceived: oid(me._id) }, $inc: { followersCount: 1 } }),
-    ]);
+    await addFollowEdge(me._id, target._id);
 
     await Promise.all([
       syncFollowedUsersPromotionCounter(me._id),
@@ -442,28 +467,7 @@ exports.unfollowUser = async (req, res) => {
     if (!me) return res.status(401).json({ message: 'No autorizado' });
     if (!target) return res.status(404).json({ message: 'Usuario objetivo no encontrado' });
 
-    await Promise.all([
-      User.updateOne(
-        { _id: oid(me._id) },
-        {
-          $pull: {
-            following: oid(target._id),
-            followRequestsSent: oid(target._id),
-          },
-          $inc: { followingCount: -1 },
-        }
-      ),
-      User.updateOne(
-        { _id: oid(target._id) },
-        {
-          $pull: {
-            followers: oid(me._id),
-            followRequestsReceived: oid(me._id),
-          },
-          $inc: { followersCount: -1 },
-        }
-      ),
-    ]);
+    await removeFollowEdge(me._id, target._id);
 
     await clearFollowRequestNotification({ actorId: me._id, targetId: target._id });
 
@@ -514,14 +518,19 @@ exports.getFollowers = async (req, res) => {
 
     const u = await User.findById(req.params.id)
       .select(`followers ${PRIVACY_FIELDS}`)
-      .populate('followers', '_id username profilePicture');
+      .populate('followers', '_id username phoneNumber profilePicture');
     if (!u) return res.status(404).json({ message: 'Usuario no encontrado' });
 
     if (!(await canViewSocialLists(req, u))) {
       return res.status(403).json({ message: 'Este perfil es privado' });
     }
 
-    res.json({ count: u.followers.length, followers: u.followers });
+    // Misma forma que antes ({ _id, username, profilePicture }); username público, sin teléfono
+    const followers = u.followers.map((f) => {
+      const { phoneNumber, ...pub } = sanitizePublicUser(f.toObject ? f.toObject() : f);
+      return pub;
+    });
+    res.json({ count: followers.length, followers });
   } catch (err) {
     console.error('[getFollowers] error', err);
     res.status(500).json({ message: 'Error en servidor' });
@@ -537,17 +546,199 @@ exports.getFollowing = async (req, res) => {
 
     const u = await User.findById(req.params.id)
       .select(`following followers ${PRIVACY_FIELDS}`)
-      .populate('following', '_id username profilePicture');
+      .populate('following', '_id username phoneNumber profilePicture');
     if (!u) return res.status(404).json({ message: 'Usuario no encontrado' });
 
     if (!(await canViewSocialLists(req, u))) {
       return res.status(403).json({ message: 'Este perfil es privado' });
     }
 
-    res.json({ count: u.following.length, following: u.following });
+    // Misma forma que antes ({ _id, username, profilePicture }); username público, sin teléfono
+    const following = u.following.map((f) => {
+      const { phoneNumber, ...pub } = sanitizePublicUser(f.toObject ? f.toObject() : f);
+      return pub;
+    });
+    res.json({ count: following.length, following });
   } catch (err) {
     console.error('[getFollowing] error', err);
     res.status(500).json({ message: 'Error en servidor' });
+  }
+};
+
+
+// ———————————————————————————————————————————————————————————————————————
+// Listas paginadas (pantalla Seguidores / Seguidos)
+// GET /api/social/users/:id/followers/page   y   /following/page
+//   :id = _id o "me". Query: limit (1..50, 30), cursor, q (búsqueda por nombre).
+// Orden: primero a quienes sigue quien consulta, después el resto; dentro de
+// cada grupo, del seguimiento más reciente al más antiguo (posición en el
+// array: los nuevos se añaden al final). El cursor guarda grupo + id (y la
+// posición, por si esa persona desaparece de la lista entre páginas).
+// Cada fila: { _id, displayName, username, avatarUrl, iFollow, isMe, requested }
+// ———————————————————————————————————————————————————————————————————————
+const PAGE_DEFAULT = 30;
+const PAGE_MAX = 50;
+
+const backendBase = (req) => process.env.BACKEND_URL || `${req.protocol}://${req.get('host')}`;
+const absUrlFromUpload = (req, p) => {
+  if (!p) return null;
+  const str = String(p);
+  if (str.startsWith('http')) {
+    const idx = str.indexOf('/uploads/');
+    return idx !== -1 ? `${backendBase(req)}${str.substring(idx)}` : str;
+  }
+  return `${backendBase(req)}${str.startsWith('/') ? str : `/${str}`}`;
+};
+
+const encodeCursor = (c) => Buffer.from(JSON.stringify(c)).toString('base64url');
+const decodeCursor = (raw) => {
+  try {
+    const c = JSON.parse(Buffer.from(String(raw), 'base64url').toString('utf8'));
+    if (c && (c.g === 0 || c.g === 1) && typeof c.id === 'string' && Number.isInteger(c.i)) return c;
+  } catch (_) {}
+  return null;
+};
+const escapeRegExp = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+const listSocialPage = (kind) => async (req, res) => {
+  try {
+    const viewer = await resolveUserByKey(pickUserId(req));
+    if (!viewer) return res.status(401).json({ error: 'unauthorized', message: 'No autorizado' });
+    const viewerId = String(viewer._id);
+
+    const rawId = String(req.params.id || '');
+    const targetId = rawId === 'me' ? viewerId : rawId;
+    if (!isObjectId(targetId)) return res.status(404).json({ error: 'user_not_found', message: 'Usuario no encontrado' });
+
+    // followers: siempre, para saber si quien consulta puede ver un perfil privado
+    const fields = kind === 'followers' ? 'followers' : 'following followers';
+    const target = await User.findById(targetId).select(`${fields} ${PRIVACY_FIELDS}`).lean();
+    if (!target) return res.status(404).json({ error: 'user_not_found', message: 'Usuario no encontrado' });
+
+    if (!(await canViewSocialLists(req, target))) {
+      return res.status(403).json({ error: 'private_profile', message: 'Este perfil es privado' });
+    }
+
+    const limitRaw = parseInt(req.query.limit, 10);
+    const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 1), PAGE_MAX) : PAGE_DEFAULT;
+
+    // Lista completa con su posición (posición mayor = seguimiento más reciente)
+    let entries = (target[kind] || []).map((id, i) => ({ id: String(id), i }));
+
+    // Búsqueda por nombre (sin distinguir mayúsculas, por el principio), dentro de esta lista
+    const q = String(req.query.q || '').trim().replace(/^@/, '').slice(0, 50);
+    if (q && entries.length) {
+      const rx = new RegExp(`^${escapeRegExp(q)}`, 'i');
+      const hits = await User.find({
+        _id: { $in: entries.map((e) => oid(e.id)) },
+        $or: [
+          // un username sacado del teléfono no se puede buscar
+          { $and: [{ username: rx }, NOT_PHONE_DERIVED_USERNAME] },
+          { entityName: rx },
+          { entName: rx },
+        ],
+      })
+        .select('_id')
+        .lean();
+      const hitSet = new Set(hits.map((h) => String(h._id)));
+      entries = entries.filter((e) => hitSet.has(e.id));
+    }
+
+    const iFollowSet = new Set((viewer.following || []).map(String));
+    const requestedSet = new Set((viewer.followRequestsSent || []).map(String));
+
+    // Orden: grupo (0 = lo sigo, 1 = el resto) y, dentro, más reciente primero
+    const ordered = entries
+      .map((e) => ({ ...e, g: iFollowSet.has(e.id) ? 0 : 1 }))
+      .sort((a, b) => a.g - b.g || b.i - a.i);
+
+    // Cursor: continuar justo después del último de la página anterior
+    let start = 0;
+    if (req.query.cursor) {
+      const c = decodeCursor(req.query.cursor);
+      if (!c) return res.status(400).json({ error: 'invalid_cursor', message: 'Cursor inválido' });
+      const pos = ordered.findIndex((e) => e.id === c.id && e.g === c.g);
+      start = pos !== -1
+        ? pos + 1
+        // Ya no está en ese grupo (dejó de seguir, etc.): por su posición guardada
+        : ordered.findIndex((e) => e.g > c.g || (e.g === c.g && e.i < c.i));
+      if (start === -1) start = ordered.length;
+    }
+
+    const page = ordered.slice(start, start + limit);
+    const users = page.length
+      ? await User.find({ _id: { $in: page.map((e) => oid(e.id)) } })
+          // phoneNumber: solo para detectar nombres sacados del teléfono; nunca sale
+          .select('_id username entityName entName phoneNumber profilePicture')
+          .lean()
+      : [];
+    const byId = new Map(users.map((u) => [String(u._id), u]));
+
+    const items = page
+      .filter((e) => byId.has(e.id)) // cuentas borradas que aún figuran en el array
+      .map((e) => {
+        const u = byId.get(e.id);
+        const iFollow = iFollowSet.has(e.id);
+        return {
+          _id: e.id,
+          displayName: publicDisplayName(u),
+          username: publicUsername(u),
+          avatarUrl: absUrlFromUpload(req, u.profilePicture),
+          iFollow,
+          isMe: e.id === viewerId,
+          requested: !iFollow && requestedSet.has(e.id),
+        };
+      });
+
+    const last = page[page.length - 1];
+    const hasMore = start + limit < ordered.length;
+    return res.json({
+      items,
+      nextCursor: hasMore && last ? encodeCursor({ g: last.g, i: last.i, id: last.id }) : null,
+      total: ordered.length,
+    });
+  } catch (err) {
+    console.error(`[listSocialPage:${kind}] error`, err);
+    return res.status(500).json({ message: 'Error en servidor' });
+  }
+};
+
+exports.getFollowersPage = listSocialPage('followers');
+exports.getFollowingPage = listSocialPage('following');
+
+// ———————————————————————————————————————————————————————————————————————
+// Eliminar a alguien de MIS seguidores
+// DELETE /api/social/users/me/followers/:id
+// Para el seguidor eliminado es como si hubiera dejado de seguirme: deja de
+// seguirme (contadores de los dos), y se sincroniza su contador de follow_users
+// (la misión se recalcula al abrir promociones: los niveles canjeados no se tocan).
+// Sin notificación, igual que al dejar de seguir.
+// ———————————————————————————————————————————————————————————————————————
+exports.removeFollower = async (req, res) => {
+  try {
+    const me = await resolveUserByKey(pickUserId(req));
+    if (!me) return res.status(401).json({ error: 'unauthorized', message: 'No autorizado' });
+
+    const followerId = String(req.params.id || '');
+    if (!isObjectId(followerId)) {
+      return res.status(404).json({ error: 'not_a_follower', message: 'Esta persona no te sigue' });
+    }
+    if (followerId === String(me._id)) {
+      return res.status(400).json({ error: 'cannot_remove_self', message: 'No puedes eliminarte a ti mismo' });
+    }
+
+    const { removed } = await removeFollowEdge(followerId, me._id);
+    if (!removed) {
+      return res.status(404).json({ error: 'not_a_follower', message: 'Esta persona no te sigue' });
+    }
+
+    await syncFollowedUsersPromotionCounter(followerId);
+
+    const refreshed = await User.findById(me._id).select('followersCount').lean();
+    return res.json({ ok: true, removed: true, followersCount: refreshed?.followersCount ?? 0 });
+  } catch (err) {
+    console.error('[removeFollower] err', err);
+    return res.status(500).json({ message: 'Error en servidor' });
   }
 };
 
@@ -595,24 +786,8 @@ exports.acceptFollowRequest = async (req, res) => {
       return res.status(404).json({ message: 'Solicitud no encontrada' });
     }
 
-    await Promise.all([
-      User.updateOne(
-        { _id: oid(requester._id) },
-        {
-          $pull: { followRequestsSent: oid(me._id) },
-          $addToSet: { following: oid(me._id) },
-          $inc: { followingCount: 1 },
-        }
-      ),
-      User.updateOne(
-        { _id: oid(me._id) },
-        {
-          $pull: { followRequestsReceived: oid(requester._id) },
-          $addToSet: { followers: oid(requester._id) },
-          $inc: { followersCount: 1 },
-        }
-      ),
-    ]);
+    // requester pasa a seguirme (contadores condicionados; quita la solicitud)
+    await addFollowEdge(requester._id, me._id);
 
     await Promise.all([
       syncFollowedUsersPromotionCounter(requester._id),

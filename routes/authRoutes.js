@@ -17,6 +17,14 @@ const {
 } = require("../middlewares/authMiddleware");
 
 const mongoose = require("mongoose");
+// Nombres públicos: nunca nada derivado del teléfono (utils/publicName.js)
+const {
+  neutralAlias,
+  publicUsername,
+  publicDisplayName,
+  sanitizePublicUser,
+  NOT_PHONE_DERIVED_USERNAME,
+} = require("../utils/publicName");
 const { Types: { ObjectId } } = mongoose;
 
 function isValidObjectId(v) {
@@ -219,9 +227,11 @@ router.post(
       // Si no existe y venimos con Firebase, crea espectador mínimo
       if (!user && req.firebaseUser && req.firebaseUser.uid) {
         const phone = req.firebaseUser.phone_number || "";
-        const username = phone ? `user_${phone.replace(/\D/g, '').slice(-6)}` : `user_${Date.now()}`;
+        // username neutro del _id (antes: "user_" + 6 últimos dígitos del teléfono)
+        const _id = new mongoose.Types.ObjectId();
         user = await User.create({
-          username,
+          _id,
+          username: neutralAlias(_id),
           phoneNumber: phone,
           firebaseUid: req.firebaseUser.uid,
           role: "spectator",
@@ -262,12 +272,12 @@ router.post("/ensure", anyAuth, ensureUserId, async (req, res) => {
     // Si no existe aún pero venimos con Firebase, lo creamos básico
     if (!user && req.firebaseUser && req.firebaseUser.uid) {
       const phone = req.firebaseUser.phone_number || "";
-      const fallbackUsername = phone
-        ? `user_${phone.replace(/\D/g, "").slice(-6)}`
-        : `user_${Date.now()}`;
+      // username neutro del _id (antes: "user_" + 6 últimos dígitos del teléfono)
+      const _id = new mongoose.Types.ObjectId();
 
       user = await User.create({
-        username: fallbackUsername,
+        _id,
+        username: neutralAlias(_id),
         phoneNumber: phone,
         firebaseUid: req.firebaseUser.uid,
         role: "spectator",
@@ -454,11 +464,12 @@ router.get("/me/attending", anyAuth, ensureUserId, async (req, res) => {
     if (!me) return res.status(404).json({ message: "Usuario no encontrado" });
     const events = await Event.find({ attendees: me._id })
       .sort({ date: 1 })
-      .populate("createdBy", "username email profilePicture")
+      .populate("createdBy", "username phoneNumber profilePicture")
       .lean();
 
     const formatted = events.map((ev) => ({
       ...ev,
+      createdBy: sanitizePublicUser(ev.createdBy), // username público, sin teléfono
       ...accessInfo(ev), // accessType + requiresTicket: qué botón mostrar sin pedir el detalle
       ...eventAvailability(ev), // soldOut + spotsLeft (sin consultas extra)
       categories: Array.isArray(ev.categories)
@@ -488,11 +499,12 @@ router.get("/users/me/attending", anyAuth, ensureUserId, async (req, res) => {
     if (!me) return res.status(404).json({ message: "Usuario no encontrado" });
     const events = await Event.find({ attendees: me._id })
       .sort({ date: 1 })
-      .populate("createdBy", "username email profilePicture")
+      .populate("createdBy", "username phoneNumber profilePicture")
       .lean();
 
     const formatted = events.map((ev) => ({
       ...ev,
+      createdBy: sanitizePublicUser(ev.createdBy), // username público, sin teléfono
       ...accessInfo(ev), // accessType + requiresTicket: qué botón mostrar sin pedir el detalle
       ...eventAvailability(ev), // soldOut + spotsLeft (sin consultas extra)
       categories: Array.isArray(ev.categories)
@@ -879,13 +891,14 @@ const searchUsersHandler = async (req, res) => {
 
     const users = await User.find({
       $or: [
-        { username: rx },
+        // Los usernames sacados del teléfono no se buscan (permitiría buscar por número)
+        { $and: [{ username: rx }, NOT_PHONE_DERIVED_USERNAME] },
         { entityName: rx },
         { entName: rx },
         { instagram: rx },
       ],
     })
-      .select("username entityName entName role profilePicture instagram bio isPrivate createdAt")
+      .select("username phoneNumber entityName entName role profilePicture instagram bio isPrivate createdAt")
       .sort({ createdAt: -1 })
       .limit(40)
       .lean();
@@ -893,7 +906,7 @@ const searchUsersHandler = async (req, res) => {
     const formatted = users.map((u) => ({
       id: u._id?.toString?.() || u._id,
       _id: u._id,
-      username: u.username,
+      username: publicUsername(u),
       entityName: u.entityName || u.entName || "",
       role: u.role,
       profilePicture: u.profilePicture || "",
@@ -918,12 +931,44 @@ router.get("/users/search", searchUsersHandler);
 router.get("/searchUsers", searchUsersHandler);
 
 /* -------- Obtener usuario por id (pública) — al final -------- */
-router.get("/:userId", async (req, res) => {
+// Antes: pública y sin sesión, devolvía el documento entero (teléfono, email,
+// firebaseUid, seguidores, solicitudes...). Ahora exige sesión y, salvo para
+// el propio usuario, devuelve solo lo público (lo mismo que GET /api/users/:id).
+router.get("/:userId", anyAuth, ensureUserId, async (req, res) => {
   try {
+    if (!mongoose.isValidObjectId(String(req.params.userId || ""))) {
+      return res.status(404).json({ message: "Usuario no encontrado" });
+    }
     const user = await User.findById(req.params.userId);
     if (!user)
       return res.status(404).json({ message: "Usuario no encontrado" });
-    res.json(user);
+
+    // El propio usuario: sus datos completos (sin contraseña ni tokens: toJSON)
+    const viewer = await resolveUserFromRequest(req);
+    if (viewer && String(viewer._id) === String(user._id)) {
+      return res.json(user.toJSON());
+    }
+
+    // Cualquier otro: solo lo público. Nunca email, teléfono, firebaseUid,
+    // listas de seguidores/seguidos ni solicitudes.
+    const base = process.env.BACKEND_URL || `${req.protocol}://${req.get("host")}`;
+    const pic = user.profilePicture || null;
+    const avatarUrl = !pic
+      ? null
+      : String(pic).startsWith("http")
+        ? String(pic)
+        : `${base}${String(pic).startsWith("/") ? pic : `/${pic}`}`;
+    res.json({
+      _id: user._id,
+      id: String(user._id),
+      username: publicUsername(user),
+      displayName: publicDisplayName(user),
+      profilePicture: pic,
+      avatarUrl,
+      followersCount: user.followersCount ?? (user.followers || []).length,
+      followingCount: user.followingCount ?? (user.following || []).length,
+      isPrivate: !!user.isPrivate,
+    });
   } catch (error) {
     res.status(500).json({ message: "Error al obtener el usuario" });
   }

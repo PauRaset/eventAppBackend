@@ -27,6 +27,13 @@ const { sendPushNotificationToUser } = require("../utils/sendPushNotification");
 const { geocodeAddress, applyGeo, buildAddress } = require("../utils/geocode");
 const { sanitizeTiers, validateTierChanges, syncEventPrice } = require("../utils/tiers");
 const { accessInfo, accessTypeOf, validateAccessType, deriveAccessType } = require("../utils/accessType");
+// Nombres públicos: nunca nada derivado del teléfono (utils/publicName.js)
+const {
+  publicUsername,
+  publicDisplayName,
+  publicStoredName,
+  sanitizePublicUser,
+} = require("../utils/publicName");
 const { issueTicketsForOrder, sendOrderTicketsEmail } = require("../utils/ticketIssuing");
 const {
   sellStockDirect,
@@ -187,7 +194,7 @@ function shapePhotoSignatures(req, signatures = [], viewerUserId = null, cap = 6
   const list = Array.isArray(signatures) ? signatures : [];
   const shaped = list.slice(0, cap).map((s) => ({
     userId: String(s?.userId || ""),
-    username: s?.username || null,
+    username: s?.userId ? publicStoredName(s?.username, s.userId) : null,
     avatarUrl: absUrlFromUpload(req, s?.profilePicture || null),
     x: typeof s?.x === "number" ? s.x : 0,
     y: typeof s?.y === "number" ? s.y : 0,
@@ -230,11 +237,8 @@ async function createPhotoReactionNotification({ req, event, photo, reactionType
     // No notificar si reaccionas a tu propia foto.
     if (String(actorId) === String(ownerId)) return;
 
-    const actor = await User.findById(actorId).select("username displayName profilePicture").lean();
-    const actorName =
-      actor?.username ||
-      actor?.displayName ||
-      "Alguien";
+    const actor = await User.findById(actorId).select("username displayName phoneNumber profilePicture").lean();
+    const actorName = actor ? publicUsername(actor) : "Alguien";
 
     const eventTitle = event?.title || "un evento";
     const photoId = photo?.photoId || rawPhotoValue(photo) || "";
@@ -1520,13 +1524,11 @@ async function processImageToJpg(srcPath, outDir, baseName) {
 /* -------------------------------------------------------------
    Helpers de normalización de fotos con metadatos
 ------------------------------------------------------------- */
+// Se guarda en fotos (byUsername) y firmas: nombre público, nunca del teléfono.
+// (Antes, sin username, guardaba los dígitos del teléfono.)
 function usernameFromUserDoc(u) {
   if (!u) return null;
-  return (
-    u.username ||
-    (u.phoneNumber ? u.phoneNumber.replace("+", "") : null) ||
-    null
-  );
+  return publicUsername(u);
 }
 
 function toPhotoTileAbs(req, entry, viewerUserId = null) {
@@ -1539,12 +1541,14 @@ function toPhotoTileAbs(req, entry, viewerUserId = null) {
   if (typeof entry === "object") {
     const url =
       absUrlFromUpload(req, entry.url || entry.path || entry.href || entry.secure_url || entry.photo || entry.image);
-    const byUsername =
+    const storedBy =
       entry.byUsername ||
       (entry.byUser && entry.byUser.username) ||
       (entry.user && entry.user.username) ||
       entry.username ||
       null;
+    // Guardado al subir: los antiguos pueden ser dígitos del teléfono
+    const byUsername = storedBy && entry.by ? publicStoredName(storedBy, entry.by) : storedBy && publicStoredName(storedBy, null);
 
     const reactionSummary = summarizePhotoReactions(entry.reactions || []);
     const sig = shapePhotoSignatures(req, entry.signatures, viewerUserId);
@@ -1603,11 +1607,9 @@ function shapePublicUser(req, u) {
     };
   }
 
-  const username =
-    u.username ||
-    (u.phoneNumber ? String(u.phoneNumber).replace("+", "") : "") ||
-    "";
-  const displayName = u.displayName || u.name || "";
+  // Nunca del teléfono: sin username (o derivado de él) -> alias neutro del _id
+  const username = publicUsername(u);
+  const displayName = publicDisplayName({ ...u, entityName: u.entityName || u.name });
   const profilePicture = u.profilePicture || null; // relativo (frontend lo sabe resolver)
   return {
     _id: u._id,
@@ -1768,7 +1770,7 @@ router.get("/mine", anyAuth, ensureUserId, async (req, res) => {
       // Sin "+qrToken" el backfill de abajo regeneraría el token en cada carga.
       .select("+qrToken")
       .sort({ startAt: -1, date: -1, createdAt: -1 })
-      .populate("createdBy", "username email profilePicture displayName");
+      .populate("createdBy", "username phoneNumber profilePicture displayName");
 
     // Backfill de qrToken para eventos antiguos que no lo tengan todavía.
     for (const doc of docs) {
@@ -1793,7 +1795,7 @@ router.get("/mine", anyAuth, ensureUserId, async (req, res) => {
         photos,
         createdBy: event.createdBy
           ? {
-              ...event.createdBy,
+              ...sanitizePublicUser(event.createdBy), // username público, sin teléfono
               profilePictureUrl: absUrlFromUpload(req, event.createdBy.profilePicture),
             }
           : null,
@@ -1818,7 +1820,7 @@ router.get("/mine", anyAuth, ensureUserId, async (req, res) => {
 ------------------------------------------------------------------- */
 router.get("/", optionalUserId, async (req, res) => {
   try {
-    const events = await Event.find().populate("createdBy", "username email profilePicture displayName").lean();
+    const events = await Event.find().populate("createdBy", "username phoneNumber profilePicture displayName").lean();
 
     const formattedEvents = events.map((event) => {
       // normaliza fotos a objetos con url absoluta (manteniendo compatibilidad)
@@ -1834,7 +1836,7 @@ router.get("/", optionalUserId, async (req, res) => {
         photos,
         createdBy: event.createdBy
           ? {
-              ...event.createdBy,
+              ...sanitizePublicUser(event.createdBy), // username público, sin teléfono
               profilePictureUrl: absUrlFromUpload(req, event.createdBy.profilePicture),
             }
           : null,
@@ -1885,7 +1887,7 @@ router.get("/search", optionalUserId, async (req, res) => {
     const events = await Event.find(filter)
       .sort({ startAt: 1, date: 1, createdAt: -1 })
       .limit(40)
-      .populate("createdBy", "username email profilePicture displayName")
+      .populate("createdBy", "username phoneNumber profilePicture displayName")
       .lean();
 
     const formattedEvents = events.map((event) => {
@@ -1901,7 +1903,7 @@ router.get("/search", optionalUserId, async (req, res) => {
         photos,
         createdBy: event.createdBy
           ? {
-              ...event.createdBy,
+              ...sanitizePublicUser(event.createdBy), // username público, sin teléfono
               profilePictureUrl: absUrlFromUpload(req, event.createdBy.profilePicture),
             }
           : null,
@@ -2305,7 +2307,10 @@ function normalizePhoneLoose(raw) {
 function assignmentView(t) {
   if (!t.claimToken && !t.assignedAt && !t.assignedToUserId) return null;
   return {
-    name: t.assignedToName || "",
+    // Asignación a un usuario de la app: su username (guardado al asignar) puede
+    // ser uno antiguo sacado del teléfono -> nombre público. Por enlace: el
+    // nombre que escribió el propio comprador.
+    name: t.assignedToUserId ? publicStoredName(t.assignedToName, t.assignedToUserId) || "" : t.assignedToName || "",
     phone: t.assignedToPhone || "",
     userId: t.assignedToUserId || null,
     assignedAt: t.assignedAt || null,
@@ -2323,7 +2328,7 @@ async function findAssignableUser(userId) {
   const key = typeof userId === "string" ? userId.trim() : "";
   if (!key) return null;
   const filter = /^[a-fA-F0-9]{24}$/.test(key) ? { _id: key } : { firebaseUid: key };
-  return User.findOne(filter).select("_id username role firebaseUid").lean();
+  return User.findOne(filter).select("_id username role firebaseUid phoneNumber").lean();
 }
 
 /**
@@ -2335,12 +2340,12 @@ async function notifyTicketAssigned({ req, ticket, recipient }) {
   try {
     const buyerId = String(req.user?.id || "");
     const [buyer, ev] = await Promise.all([
-      mongoose.isValidObjectId(buyerId) ? User.findById(buyerId).select("username").lean() : null,
+      mongoose.isValidObjectId(buyerId) ? User.findById(buyerId).select("username phoneNumber").lean() : null,
       mongoose.isValidObjectId(String(ticket.eventId))
         ? Event.findById(ticket.eventId).select("_id title image").lean()
         : null,
     ]);
-    const buyerName = buyer?.username || "Alguien";
+    const buyerName = buyer ? publicUsername(buyer) : "Alguien";
     const eventTitle = ev?.title || "un evento";
 
     const notification = await Notification.findOneAndUpdate(
@@ -2357,7 +2362,7 @@ async function notifyTicketAssigned({ req, ticket, recipient }) {
           read: false,
           readAt: null,
           pushSent: false,
-          meta: { eventTitle, givenByUsername: buyer?.username || "" },
+          meta: { eventTitle, givenByUsername: buyer ? publicUsername(buyer) : "" },
         },
         $setOnInsert: { user: recipient._id, type: "ticket_assigned", ticketId: ticket._id },
       },
@@ -2467,13 +2472,14 @@ router.get("/my-tickets/full", anyAuth, ensureUserId, async (req, res) => {
             { firebaseUid: { $in: giverKeys } },
           ],
         })
-          .select("_id firebaseUid username")
+          .select("_id firebaseUid username phoneNumber")
           .lean()
       : [];
     const giverNameByKey = new Map();
     for (const g of givers) {
-      giverNameByKey.set(String(g._id), g.username || "");
-      if (g.firebaseUid) giverNameByKey.set(String(g.firebaseUid), g.username || "");
+      const name = publicUsername(g);
+      giverNameByKey.set(String(g._id), name);
+      if (g.firebaseUid) giverNameByKey.set(String(g.firebaseUid), name);
     }
 
     // --- Carga en bloque: eventos, órdenes y clubs ---
@@ -2498,12 +2504,12 @@ router.get("/my-tickets/full", anyAuth, ensureUserId, async (req, res) => {
     const [clubs, owners] = await Promise.all([
       clubRefIds.length ? Club.find({ _id: { $in: clubRefIds } }).select("_id name").lean() : [],
       ownerRefIds.length
-        ? User.find({ _id: { $in: ownerRefIds } }).select("_id entityName entName displayName username").lean()
+        ? User.find({ _id: { $in: ownerRefIds } }).select("_id entityName entName displayName username phoneNumber").lean()
         : [],
     ]);
     const clubNameById = new Map(clubs.map((c) => [String(c._id), c.name]));
     const ownerNameById = new Map(
-      owners.map((u) => [String(u._id), u.entityName || u.entName || u.displayName || u.username || ""])
+      owners.map((u) => [String(u._id), publicDisplayName(u)])
     );
 
     const now = Date.now();
@@ -2702,7 +2708,7 @@ async function assignToAppUser(req, res, ticket) {
     {
       $set: {
         assignedToUserId: recipientId,
-        assignedToName: recipient.username || "",
+        assignedToName: publicUsername(recipient),
         assignedToPhone: "",
         assignedAt: new Date(),
         // Sin enlace: si había uno (asignación por enlace), deja de valer
@@ -2904,8 +2910,8 @@ ticketClaimRouter.get("/claim/:claimToken", claimLimiter, async (req, res) => {
       clubName = c?.name || "";
     }
     if (!clubName && ev?.createdBy) {
-      const u = await User.findById(ev.createdBy).select("entityName entName displayName username").lean();
-      clubName = u?.entityName || u?.entName || u?.displayName || u?.username || "";
+      const u = await User.findById(ev.createdBy).select("entityName entName displayName username phoneNumber").lean();
+      clubName = u ? publicDisplayName(u) : "";
     }
 
     // Primera apertura del enlace
@@ -3211,7 +3217,7 @@ router.get("/:id", optionalUserId, async (req, res) => {
   try {
     const event = await Event.findById(req.params.id).populate(
       "createdBy",
-      "username email profilePicture displayName"
+      "username phoneNumber profilePicture displayName"
     );
     if (!event) return res.status(404).json({ message: "Evento no encontrado" });
 
@@ -3228,7 +3234,7 @@ router.get("/:id", optionalUserId, async (req, res) => {
       photos: approvedOnly(obj.photos).map((p) => toPhotoTileAbs(req, p, req.user?.id || null)).filter(Boolean),
       createdBy: obj.createdBy
         ? {
-            ...obj.createdBy,
+            ...sanitizePublicUser(obj.createdBy), // username público, sin teléfono
             profilePictureUrl: absUrlFromUpload(req, obj.createdBy.profilePicture),
           }
         : null,
@@ -3570,7 +3576,7 @@ router.get("/:id/photos/moderation", anyAuth, ensureUserId, async (req, res) => 
       url: buildEventPhotoAccessUrl(req, id, p.photoId || ""),
       rawUrl: rawPhotoValue(p),
       by: p.by || null,
-      byUsername: p.byUsername || null,
+      byUsername: publicStoredName(p.byUsername, p.by), // los antiguos pueden ser del teléfono
       uploadedAt: p.uploadedAt || null,
       status: p.status || "approved",
       reviewedBy: p.reviewedBy || null,
@@ -3954,7 +3960,7 @@ async function postPhotosHandler(req, res) {
     const uploaded = savedMeta.map((m) => ({
       photoId: m.photoId,
       url: absUrlFromUpload(req, m.url),
-      byUsername: m.byUsername,
+      byUsername: publicStoredName(m.byUsername, m.by),
       uploadedAt: m.uploadedAt,
       status: m.status,
       missionType: m.missionType || null,
@@ -4089,7 +4095,7 @@ router.delete("/:id/photos/:pid?", anyAuth, ensureUserId, async (req, res) => {
         ? { url: absUrlFromUpload(req, removedEntry) }
         : {
             url: absUrlFromUpload(req, removedEntry?.url || removedEntry?.path || removedEntry?.image || removedEntry?.photo),
-            byUsername: removedEntry?.byUsername || null,
+            byUsername: publicStoredName(removedEntry?.byUsername, removedEntry?.by),
             uploadedAt: removedEntry?.uploadedAt || null,
           },
       photos: outPhotos,
@@ -4597,7 +4603,7 @@ async function updateEventHandler(req, res) {
 
     // 4) Actualizar y devolver formateado
     const updated = await Event.findOneAndUpdate(updateFilter, update, { new: true })
-      .populate("createdBy", "username email profilePicture displayName")
+      .populate("createdBy", "username phoneNumber profilePicture displayName")
       .lean();
 
     if (!updated) {
@@ -4614,7 +4620,7 @@ async function updateEventHandler(req, res) {
       photos: approvedOnly(updated.photos).map((p) => toPhotoTileAbs(req, p, req.user?.id || null)).filter(Boolean),
       createdBy: updated.createdBy
         ? {
-            ...updated.createdBy,
+            ...sanitizePublicUser(updated.createdBy), // username público, sin teléfono
             profilePictureUrl: absUrlFromUpload(req, updated.createdBy.profilePicture),
           }
         : null,

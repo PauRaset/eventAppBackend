@@ -606,12 +606,15 @@ userSchema.statics.findOrCreateFromFirebase = async function ({
 
   // 2) Crear si no existe
   if (!user) {
+    // Sin nombre: alias neutro del _id (antes "user_" + 6 últimos dígitos del
+    // teléfono, que luego salía en público como username)
+    const newId = new mongoose.Types.ObjectId();
     const usernameBase =
       (displayName && displayName.trim()) ||
-      (phoneNumber ? `user_${phoneNumber.replace(/\D/g, "").slice(-6)}` : null) ||
-      (uid ? `user_${uid.slice(0, 8)}` : "user");
+      require("../utils/publicName").neutralAlias(newId);
 
     user = new User({
+      _id: newId,
       firebaseUid: uid || undefined,
       phoneNumber: phoneNumber || undefined,
       username: usernameBase,

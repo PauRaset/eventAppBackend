@@ -7,6 +7,7 @@ const Club = require('../models/Club');
 const User = require('../models/User');
 const { reserveStock, releaseStock, sweepExpiredReservations } = require('../utils/stock');
 const { accessTypeOf } = require('../utils/accessType');
+const { publicDisplayName } = require('../utils/publicName'); // nombres públicos, nunca del teléfono
 
 // Respuesta para eventos gratuitos en las rutas de compra (Stripe no admite 0 €).
 //  free_limited: la plaza se reserva gratis desde la app (POST /api/events/:id/reserve) -> 400
@@ -471,8 +472,8 @@ async function venueNameForEvent(event) {
       if (c?.name) return c.name;
     }
     if (event.createdBy) {
-      const u = await User.findById(event.createdBy).select('displayName username').lean();
-      return u?.displayName || u?.username || '';
+      const u = await User.findById(event.createdBy).select('displayName username entityName entName phoneNumber').lean();
+      return u ? publicDisplayName(u) : ''; // nunca nada del teléfono
     }
   } catch (_) {}
   return '';

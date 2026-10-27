@@ -9,6 +9,9 @@ const sendSimpleEmail = require('../utils/sendSimpleEmail');
 let User = null;
 try { User = require('../models/User'); } catch { /* opcional */ }
 
+// Rutas de administración (listar/aprobar/rechazar solicitudes): solo admins.
+// Antes estaban abiertas a cualquiera ("TODO: proteger con tu middleware admin").
+const requireAdmin = require('../middlewares/requireAdmin');
 const router = express.Router();
 
 const cleanEmail = (e='') => e.toLowerCase().trim();
@@ -108,9 +111,8 @@ router.post('/verify', async (req, res) => {
 /**
  * GET /api/registration/applications (ADMIN)
  */
-router.get('/applications', async (req, res) => {
+router.get('/applications', requireAdmin, async (req, res) => {
   try {
-    // TODO: proteger con tu middleware admin
     const { status } = req.query;
     const filter = status ? { status } : {};
     const list = await ClubApplication.find(filter).sort({ createdAt: -1 }).lean();
@@ -125,9 +127,8 @@ router.get('/applications', async (req, res) => {
  * POST /api/registration/applications/:id/approve (ADMIN)
  * Crea el Club + genera scannerApiKey y envía link para crear contraseña.
  */
-router.post('/applications/:id/approve', async (req, res) => {
+router.post('/applications/:id/approve', requireAdmin, async (req, res) => {
   try {
-    // TODO: proteger con tu middleware admin
     const { id } = req.params;
     const appDoc = await ClubApplication.findById(id);
     if (!appDoc) return res.status(404).json({ ok: false, error: 'not_found' });
@@ -193,9 +194,8 @@ router.post('/applications/:id/approve', async (req, res) => {
 /**
  * POST /api/registration/applications/:id/reject (ADMIN)
  */
-router.post('/applications/:id/reject', async (req, res) => {
+router.post('/applications/:id/reject', requireAdmin, async (req, res) => {
   try {
-    // TODO: proteger con tu middleware admin
     const { id } = req.params;
     const { reason = '' } = req.body || {};
     const appDoc = await ClubApplication.findById(id);

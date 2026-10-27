@@ -10,10 +10,25 @@ const {
   rejectFollowRequest,
   getFollowers,
   getFollowing,
+  getFollowersPage,
+  getFollowingPage,
+  removeFollower,
   getUserStats,
 } = require('../controllers/socialController');
 
+const rateLimit = require('express-rate-limit');
 const { anyAuth, anyAuthWithId } = require('../middlewares/authMiddleware');
+
+// Eliminar seguidores: por usuario (va después de anyAuthWithId)
+const removeFollowerLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => `rmfollower:${req.user.id}`,
+  handler: (_req, res) =>
+    res.status(429).json({ error: 'rate_limited', message: 'Demasiadas peticiones, espera un momento' }),
+});
 
 /**
  * Compat notes:
@@ -54,6 +69,13 @@ router.post('/follow/requests/:id/reject', anyAuthWithId, rejectFollowRequest);
 // ---- Lists ----
 router.get('/users/:id/followers', anyAuthWithId, getFollowers); // auth + respeta isPrivate
 router.get('/users/:id/following', anyAuthWithId, getFollowing); // auth + respeta isPrivate
+
+// Paginadas, con búsqueda y orden (pantalla Seguidores/Seguidos). :id = _id o "me"
+router.get('/users/:id/followers/page', anyAuthWithId, getFollowersPage);
+router.get('/users/:id/following/page', anyAuthWithId, getFollowingPage);
+
+// Quitar a alguien de MIS seguidores
+router.delete('/users/me/followers/:id', anyAuthWithId, removeFollowerLimiter, removeFollower);
 
 // ---- Stats ----
 router.get('/users/:id/stats', anyAuth, getUserStats);

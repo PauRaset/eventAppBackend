@@ -6,6 +6,8 @@ const User = require("../models/User");
 const Event = require("../models/Event");
 const { accessInfo } = require("../utils/accessType");
 const { eventAvailability } = require("../utils/stock");
+// Nombres públicos: nunca nada derivado del teléfono (utils/publicName.js)
+const { publicUsername, sanitizePublicUser, NOT_PHONE_DERIVED_USERNAME } = require("../utils/publicName");
 const { anyAuthWithId } = require("../middlewares/authMiddleware");
 
 // 30 búsquedas de usuarios por minuto por usuario autenticado (va DESPUÉS de anyAuthWithId)
@@ -50,7 +52,8 @@ router.get("/users", anyAuthWithId, userSearchLimiter, async (req, res) => {
     const rx = new RegExp(escapeRegex(qRaw), "i");
     const match = {
       $or: [
-        { username: rx },
+        // Los usernames sacados del teléfono no se buscan (permitiría buscar por número)
+        { $and: [{ username: rx }, NOT_PHONE_DERIVED_USERNAME] },
         { entName: rx },
         { name: rx },
       ],
@@ -59,7 +62,7 @@ router.get("/users", anyAuthWithId, userSearchLimiter, async (req, res) => {
     const [total, items] = await Promise.all([
       User.countDocuments(match),
       User.find(match)
-        .select("_id username entName profilePicture role")
+        .select("_id username phoneNumber entName profilePicture role")
         .sort({ username: 1 })
         .skip(skip)
         .limit(pageSize)
@@ -67,7 +70,8 @@ router.get("/users", anyAuthWithId, userSearchLimiter, async (req, res) => {
     ]);
 
     res.json({
-      items,
+      // username público (nunca del teléfono); el teléfono no sale
+      items: items.map(({ phoneNumber, ...u }) => ({ ...u, username: publicUsername({ ...u, phoneNumber }) })),
       total,
       page,
       pageSize,
@@ -118,7 +122,7 @@ router.get("/events", async (req, res) => {
       Event.find(filter)
         // accessType/price/aforo/vendidas/tandas: para accessInfo y eventAvailability
         .select("title date city street image categories createdBy attendees accessType price capacity ticketsSold ticketsReserved ticketTiers salesStart salesEnd")
-        .populate("createdBy", "username profilePicture")
+        .populate("createdBy", "username phoneNumber profilePicture")
         .sort({ date: 1 })
         .skip(skip)
         .limit(pageSize)
@@ -128,7 +132,7 @@ router.get("/events", async (req, res) => {
     res.json({
       // accessType + requiresTicket: qué botón mostrar sin pedir el detalle
       // soldOut + spotsLeft: disponibilidad sin pedir /tiers (sin consultas extra)
-      items: items.map((e) => ({ ...e, ...accessInfo(e), ...eventAvailability(e) })),
+      items: items.map((e) => ({ ...e, createdBy: sanitizePublicUser(e.createdBy), ...accessInfo(e), ...eventAvailability(e) })),
       total,
       page,
       pageSize,

@@ -178,21 +178,27 @@ router.get('/mine', authenticateToken, async (req, res) => {
 /**
  * GET /api/clubs
  */
+// Pública y sin sesión: SOLO datos públicos del club. Antes devolvía los
+// documentos enteros (email del dueño y managers, cuenta de Stripe y la clave
+// del escáner de la puerta) y permitía buscar clubs por email. Los datos
+// completos del propio club están en GET /api/clubs/mine (con sesión).
+const PUBLIC_CLUB_FIELDS = '_id name slug status createdAt';
 router.get('/', async (req, res) => {
   try {
     const { ownerUserId, email, manager, slug, id } = req.query || {};
+
+    // Buscar por email / dueño / manager ya no se permite aquí (enumeración de
+    // cuentas): para "mi club", GET /api/clubs/mine.
+    if (ownerUserId || email || manager) return res.json([]);
+
     const q = {};
+    if (id) {
+      if (!HEX24.test(String(id))) return res.json([]);
+      q._id = id;
+    }
+    if (slug) q.slug = String(slug);
 
-    if (id)   q._id  = id;
-    if (slug) q.slug = slug;
-
-    const owner = (ownerUserId || email || '').toString().trim();
-    if (owner) q.ownerUserId = owner;
-
-    const mgr = (manager || '').toString().trim();
-    if (mgr) q.managers = mgr;
-
-    const clubs = await Club.find(q).sort({ createdAt: -1 }).lean();
+    const clubs = await Club.find(q).select(PUBLIC_CLUB_FIELDS).sort({ createdAt: -1 }).lean();
     return res.json(clubs);
   } catch (e) {
     console.error('GET /api/clubs error:', e);
@@ -593,4 +599,55 @@ router.post('/:id/scanner-key/regenerate', requireClubOwnerOrManager, async (req
   }
 });
 
+/**
+ * Control de acceso para rutas de un club cuyo id llega en `req.params[param]`
+ * como _id del documento Club O como _id del usuario con rol club (el portal
+ * manda uno u otro según la pantalla). Ambos se resuelven al mismo club y se
+ * exige que quien consulta sea su dueño o manager (mismo criterio que
+ * requireClubOwnerOrManager). Si no: 403. Id que no es ni lo uno ni lo otro: 404.
+ * Uso: router.get('/club/:clubId/...', ...requireClubAccessByParam('clubId'), handler)
+ */
+function requireClubAccessByParam(param = 'id') {
+  const check = async (req, res, next) => {
+    try {
+      const raw = String(req.params[param] || '');
+      if (!HEX24.test(raw)) return res.status(404).json({ error: 'club_not_found' });
+      const access = await getCallerAccess(req);
+
+      // a) _id del documento Club
+      const club = await Club.findById(raw).lean();
+      if (club) {
+        if (clubHasPerson(club, access)) return next();
+        console.warn('[clubs] acceso DENEGADO', { by: req.user?.id || null, clubId: raw, path: req.originalUrl, ip: req.ip });
+        return res.status(403).json({ error: 'forbidden', message: 'No tienes permiso sobre este club' });
+      }
+
+      // b) _id del usuario con rol club
+      const owner = User ? await User.findById(raw).select('_id firebaseUid email role').lean() : null;
+      if (!owner || owner.role !== 'club') return res.status(404).json({ error: 'club_not_found' });
+      if (access.ids.has(String(owner._id))) return next(); // su propia cuenta de club
+
+      // Clubs de esa cuenta: por _id, uid o email (el email se guarda tal cual
+      // se registró: comparación sin distinguir mayúsculas)
+      const keys = [String(owner._id), owner.firebaseUid].filter(Boolean);
+      const or = [{ ownerUserId: { $in: keys } }, { managers: { $in: keys } }];
+      const ownerEmail = owner.email && owner.email.trim();
+      if (ownerEmail) {
+        const rx = new RegExp(`^${ownerEmail.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i');
+        or.push({ ownerUserId: rx }, { managers: rx });
+      }
+      const clubs = await Club.find({ $or: or }).lean();
+      if (clubs.some((c) => clubHasPerson(c, access))) return next();
+
+      console.warn('[clubs] acceso DENEGADO', { by: req.user?.id || null, clubUserId: raw, path: req.originalUrl, ip: req.ip });
+      return res.status(403).json({ error: 'forbidden', message: 'No tienes permiso sobre este club' });
+    } catch (err) {
+      console.error('[clubs] error comprobando acceso:', err?.message || err);
+      return res.status(500).json({ error: 'server_error' });
+    }
+  };
+  return [anyAuthWithId, check].flat();
+}
+
 module.exports = router;
+module.exports.requireClubAccessByParam = requireClubAccessByParam;

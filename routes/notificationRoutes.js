@@ -1,5 +1,6 @@
 
 
+const { publicUsername } = require('../utils/publicName'); // nunca nada del teléfono
 const express = require('express');
 const mongoose = require('mongoose');
 const admin = require('../middlewares/firebaseAdmin');
@@ -65,7 +66,14 @@ function formatNotification(n) {
   const actor = n.actor && typeof n.actor === 'object' ? n.actor : null;
   const event = n.event && typeof n.event === 'object' ? n.event : null;
 
-  const actorUsername = actor?.username || actor?.name || actor?.displayName || null;
+  // Nunca nada del teléfono: username público del actor, y los textos ya
+  // guardados con su username antiguo (sacado del teléfono) se corrigen al leer.
+  const actorUsername = actor ? publicUsername(actor) : null;
+  const storedName = actor && typeof actor.username === 'string' ? actor.username.trim() : '';
+  const fixText = (t) =>
+    typeof t === 'string' && storedName && actorUsername && storedName !== actorUsername
+      ? t.split(storedName).join(actorUsername)
+      : t;
   const actorAvatar =
     actor?.profilePicture ||
     actor?.profilePic ||
@@ -80,8 +88,8 @@ function formatNotification(n) {
   return {
     id: n._id.toString(),
     type: n.type,
-    title: n.title,
-    body: n.body,
+    title: fixText(n.title),
+    body: fixText(n.body),
     routeTarget: n.routeTarget,
     read: !!n.read,
     readAt: n.readAt || null,
@@ -138,7 +146,7 @@ router.get('/', requireUser, async (req, res) => {
     const notifications = await Notification.find(query)
       .sort({ createdAt: -1 })
       .limit(limit)
-      .populate('actor', 'username name displayName profilePicture profilePic avatar photoURL photoUrl')
+      .populate('actor', 'username phoneNumber name displayName profilePicture profilePic avatar photoURL photoUrl')
       .populate('event', 'title name image coverImage imageUrl')
       .lean();
 
@@ -227,7 +235,7 @@ router.put('/:id/read', requireUser, async (req, res) => {
       },
       { new: true }
     )
-      .populate('actor', 'username name displayName profilePicture profilePic avatar photoURL photoUrl')
+      .populate('actor', 'username phoneNumber name displayName profilePicture profilePic avatar photoURL photoUrl')
       .populate('event', 'title name image coverImage imageUrl')
       .lean();
 

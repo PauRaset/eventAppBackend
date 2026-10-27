@@ -5,6 +5,8 @@ const router = express.Router();
 const Order = require('../models/Order');
 const Event = require('../models/Event');
 const mongoose = require('mongoose');
+// Nombres públicos: nunca nada derivado del teléfono (utils/publicName.js)
+const { publicUsername } = require('../utils/publicName');
 
 // (Opcional) clicks/uniqueClicks desde ShareLink
 let ShareLink;
@@ -39,7 +41,7 @@ async function enrichUsers(items, idKey = 'userId') {
   if (!or.length) return items;
 
   const users = await User.find({ $or: or })
-    .select('_id firebaseUid username profilePicture')
+    .select('_id firebaseUid username phoneNumber profilePicture') // teléfono: solo para detectar, no sale
     .lean();
 
   const byMongoId = new Map();
@@ -52,11 +54,15 @@ async function enrichUsers(items, idKey = 'userId') {
     }
   }
 
+  // Solo datos públicos: nunca teléfono, email ni firebaseUid. El id de quien
+  // refiere puede estar guardado como uid de Firebase: se devuelve su _id.
   return items.map((item) => {
     const key = String(item?.[idKey] || '').trim();
+    const u = byMongoId.get(key) || byFirebaseUid.get(key) || null;
     return {
       ...item,
-      user: byMongoId.get(key) || byFirebaseUid.get(key) || null,
+      [idKey]: u ? String(u._id) : isValidObjectId(key) ? key : null,
+      user: u ? { _id: u._id, username: publicUsername(u), profilePicture: u.profilePicture || '' } : null,
     };
   });
 }
@@ -64,7 +70,12 @@ async function enrichUsers(items, idKey = 'userId') {
  * GET /api/referrals/club/:clubId/summary
  * Resumen global del club: KPIs, top usuarios, top eventos y canales.
  */
-router.get('/club/:clubId/summary', async (req, res) => {
+// Solo el dueño o un manager del club (antes: públicas para cualquiera).
+// :clubId = _id del documento Club o del usuario club (ver clubRoutes).
+const { requireClubAccessByParam } = require('./clubRoutes');
+const clubAccess = requireClubAccessByParam('clubId');
+
+router.get('/club/:clubId/summary', ...clubAccess, async (req, res) => {
   try {
     const { clubId } = req.params;
     if (!clubId) {
@@ -343,7 +354,7 @@ router.get('/club/:clubId/summary', async (req, res) => {
  * GET /api/referrals/club/:clubId/event/:eventId
  * Ventas atribuidas por usuario que compartió + canal
  */
-router.get('/club/:clubId/event/:eventId', async (req, res) => {
+router.get('/club/:clubId/event/:eventId', ...clubAccess, async (req, res) => {
   try {
     const { clubId, eventId } = req.params;
 
@@ -522,7 +533,7 @@ router.get('/club/:clubId/event/:eventId', async (req, res) => {
 
     const rows = referrals.map((entry) => ({
       userId: entry.refUserId,
-      username: entry.user?.username || '',
+      username: entry.user ? entry.user.username : '',
       profilePicture: entry.user?.profilePicture || '',
       channel: entry.channels?.[0]?.channel || 'unknown',
       links: Number(entry.totals.links || 0),
@@ -532,7 +543,7 @@ router.get('/club/:clubId/event/:eventId', async (req, res) => {
       tickets: Number(entry.totals.tickets || 0),
       revenueEUR: Number(entry.totals.revenueEUR || 0),
       channels: entry.channels || [],
-      user: entry.user || null,
+      user: entry.user || null, // ya público (enrichUsers)
     }));
 
     return res.json({ ok: true, clubId, eventId, referrals, rows });
