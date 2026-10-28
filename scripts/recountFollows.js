@@ -4,16 +4,22 @@
 // desajustaban porque seguir / dejar de seguir hacían $inc incondicional
 // (arreglado en controllers/socialController.js).
 //
-// Uso:  node scripts/recountFollows.js [--dry-run] [--verbose]
+// Uso:  node scripts/recountFollows.js [--dry-run] [--verbose] [--fix-asymmetric]
 //
-//   --dry-run   no escribe nada: enseña cuántos y cuáles cambiarían
-//   --verbose   una línea por usuario que cambia (también sin --dry-run)
+//   --dry-run         no escribe nada: enseña cuántos y cuáles cambiarían
+//   --verbose         una línea por usuario que cambia (también sin --dry-run)
+//   --fix-asymmetric  repara además las relaciones rotas (ver abajo)
 //
-// Solo toca los dos contadores; NUNCA los arrays (los seguimientos no cambian).
-// Cada escritura está condicionada a que los contadores sigan valiendo lo que
-// se leyó: si alguien sigue o deja de seguir a la vez, ese usuario se omite y
-// se puede relanzar. Además informa (sin tocarlo) de seguimientos asimétricos:
-// A tiene a B en following pero B no tiene a A en followers, o al revés.
+// Contadores: solo se tocan los dos contadores. Cada escritura está
+// condicionada a que sigan valiendo lo que se leyó: si alguien sigue o deja de
+// seguir a la vez, ese usuario se omite y se puede relanzar.
+//
+// Relaciones rotas (asimétricas): A tiene a B en following pero B no tiene a A
+// en followers, o al revés. Sin --fix-asymmetric solo se informan. Con él se
+// QUITA el lado sobrante, de modo que la relación queda como "A no sigue a B";
+// nunca se añade un seguimiento. Antes de quitarlo se vuelve a comprobar que
+// el otro lado sigue faltando (si entretanto se completó, no se toca), y el
+// contador del usuario se ajusta en la misma operación. Se listan solo _id.
 require("dotenv").config();
 
 const mongoose = require("mongoose");
@@ -36,6 +42,7 @@ const distinctCount = (arr) => new Set((Array.isArray(arr) ? arr : []).map(Strin
 async function main() {
   const dryRun = process.argv.includes("--dry-run");
   const verbose = process.argv.includes("--verbose") || dryRun;
+  const fixAsymmetric = process.argv.includes("--fix-asymmetric");
   await mongoose.connect(pickMongoUri());
   console.log(`[recountFollows] Conectado${dryRun ? " — MODO DRY-RUN, no se escribirá nada" : ""}\n`);
 
@@ -81,10 +88,42 @@ async function main() {
     else s.skipped++;
   }
 
-  let asymFollowing = 0;
-  for (const p of followingPairs) if (!followerPairs.has(p)) asymFollowing++;
-  let asymFollowers = 0;
-  for (const p of followerPairs) if (!followingPairs.has(p)) asymFollowers++;
+  // "A>B": A sigue a B según UN solo lado
+  const onlyInFollowing = [...followingPairs].filter((p) => !followerPairs.has(p)); // en A.following, falta en B.followers
+  const onlyInFollowers = [...followerPairs].filter((p) => !followingPairs.has(p)); // en B.followers, falta en A.following
+  const asymFollowing = onlyInFollowing.length;
+  const asymFollowers = onlyInFollowers.length;
+
+  const fx = { fixed: 0, skipped: 0 };
+  if (fixAsymmetric) {
+    const toOid = (id) => new mongoose.Types.ObjectId(id);
+    console.log(`\nRelaciones rotas${dryRun ? " (se repararían)" : ""}:`);
+    for (const p of onlyInFollowing) {
+      const [a, b] = p.split(">");
+      if (verbose) console.log(`  A=${a} -> B=${b}: quitar B de A.following`);
+      if (dryRun) continue;
+      // ¿Se completó entretanto (B ya tiene a A en followers)? Entonces no se toca.
+      const completed = await User.collection.countDocuments({ _id: toOid(b), followers: toOid(a) });
+      if (completed) { fx.skipped++; continue; }
+      const r = await User.collection.updateOne(
+        { _id: toOid(a), following: toOid(b) },
+        { $pull: { following: toOid(b) }, $inc: { followingCount: -1 } }
+      );
+      if (r.modifiedCount) fx.fixed++; else fx.skipped++;
+    }
+    for (const p of onlyInFollowers) {
+      const [a, b] = p.split(">");
+      if (verbose) console.log(`  A=${a} -> B=${b}: quitar A de B.followers`);
+      if (dryRun) continue;
+      const completed = await User.collection.countDocuments({ _id: toOid(a), following: toOid(b) });
+      if (completed) { fx.skipped++; continue; }
+      const r = await User.collection.updateOne(
+        { _id: toOid(b), followers: toOid(a) },
+        { $pull: { followers: toOid(a) }, $inc: { followersCount: -1 } }
+      );
+      if (r.modifiedCount) fx.fixed++; else fx.skipped++;
+    }
+  }
 
   console.log(`\n===== Resumen${dryRun ? " (DRY-RUN: no se ha guardado nada)" : ""} =====`);
   console.log(`Usuarios revisados:                ${s.reviewed}`);
@@ -96,9 +135,13 @@ async function main() {
     console.log(`Corregidos:                        ${s.fixed}`);
     console.log(`Omitidos (cambiaron a la vez):     ${s.skipped}  -> relanzar`);
   }
-  console.log(`Seguimientos asimétricos (no se tocan):`);
+  console.log(`Seguimientos asimétricos${fixAsymmetric ? "" : " (no se tocan; --fix-asymmetric para repararlos)"}:`);
   console.log(`  en "following" sin su "followers": ${asymFollowing}`);
   console.log(`  en "followers" sin su "following": ${asymFollowers}`);
+  if (fixAsymmetric && !dryRun) {
+    console.log(`  reparados (quitado el lado sobrante): ${fx.fixed}`);
+    console.log(`  omitidos (se completaron o cambiaron a la vez): ${fx.skipped}`);
+  }
 
   await mongoose.disconnect();
   process.exit(0);

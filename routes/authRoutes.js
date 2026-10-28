@@ -76,35 +76,19 @@ const authorizeRole = (roles) => (req, res, next) => {
 
 /* ====================== RUTAS ======================= */
 
-/* -------- Registro manual (clubs) -------- */
-router.post("/register", async (req, res) => {
-  try {
-    const { username, email, entityName, password } = req.body;
-    const normEmail = cleanEmail(email);
-
-    const userExists = await User.findOne({ email: normEmail });
-    if (userExists)
-      return res.status(400).json({ message: "El correo ya está registrado" });
-
-    const user = new User({
-      username: (username || normEmail.split("@")[0]).trim(),
-      email: normEmail,
-      entName: entityName,
-      entityName, // por si quieres ya sincronizado
-      password,   // hook del modelo lo hashea
-      role: "club",
-    });
-
-    await user.save();
-
-    res.status(201).json({ message: "Usuario registrado correctamente" });
-  } catch (error) {
-    console.error("Error en el registro:", error);
-    res.status(500).json({ message: "Error en el servidor" });
-  }
+/* -------- Registro manual (RETIRADO) --------
+   Creaba cuentas con role "club" sin verificar el email ni pasar por la
+   aprobación del admin. Los clubs se registran por el registro verificado del
+   portal (/api/registration) y los espectadores por /api/auth/ensure.
+   No crea ninguna cuenta. */
+router.post("/register", (req, res) => {
+  console.warn("[auth] POST /api/auth/register retirada, llamada rechazada", {
+    ip: req.ip,
+    ua: String(req.get("user-agent") || "").slice(0, 200),
+  });
+  return res.status(410).json({ error: "gone", message: "Esta forma de registro ya no está disponible" });
 });
 
-/* -------- Login manual (clubs) -------- */
 router.post("/login", async (req, res) => {
   try {
     const { email, password } = req.body;

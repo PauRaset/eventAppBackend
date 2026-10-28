@@ -297,7 +297,11 @@ router.get("/me", anyAuth, ensureUserId, async (req, res) => {
 
 /* -------------------------------------------------------------
    PATCH/PUT /api/users/me  (actualiza perfil)
-   Campos permitidos: username, entName, wUser, role (opcional)
+   Campos permitidos: username, entName, wUser, isPrivate y privacidad.
+   `role` NO: el rol solo lo fija el backend en sus flujos (alta, aprobación
+   de un club desde el admin del registro). Si llega, se ignora en silencio
+   (sin error, para no romper clientes antiguos). Antes se aceptaba y
+   cualquiera podía ponerse role "club".
 ------------------------------------------------------------- */
 function normalizeVisibility(value, fallback = "followers") {
   const raw = (value || fallback).toString().toLowerCase().trim();
@@ -306,7 +310,7 @@ function normalizeVisibility(value, fallback = "followers") {
 }
 
 function sanitizeProfileUpdate(body) {
-  const allowed = ["username", "entName", "wUser", "role", "isPrivate"];
+  const allowed = ["username", "entName", "wUser", "isPrivate"];
   const out = {};
 
   for (const k of allowed) {
@@ -349,7 +353,8 @@ function sanitizeProfileUpdate(body) {
   return out;
 }
 
-router.patch("/me", anyAuth, ensureUserId, async (req, res) => {
+// Mismo manejador para PATCH y PUT /api/users/me
+async function updateMeHandler(req, res) {
   try {
     const update = sanitizeProfileUpdate(req.body);
     const user = await User.findByIdAndUpdate(req.user.id, update, { new: true }).lean();
@@ -370,15 +375,15 @@ router.patch("/me", anyAuth, ensureUserId, async (req, res) => {
       profilePictureUrl: absUrlFromUpload(req, user.profilePicture || user.avatar || null),
     });
   } catch (err) {
-    console.error("[PATCH /api/users/me] error:", err);
+    console.error(`[${req.method} /api/users/me] error:`, err);
     res.status(500).json({ message: "No se pudo actualizar el perfil" });
   }
-});
+}
 
-router.put("/me", anyAuth, ensureUserId, async (req, res) => {
-  // mismo handler que PATCH
-  return router.handle({ ...req, method: "PATCH" }, res);
-});
+router.patch("/me", anyAuth, ensureUserId, updateMeHandler);
+// Antes reenviaba la petición con router.handle({ ...req }), que perdía las
+// cabeceras: siempre respondía 401. Ahora usa la misma función que PATCH.
+router.put("/me", anyAuth, ensureUserId, updateMeHandler);
 
 /* -------------------------------------------------------------
    POST /api/users/me/avatar  (subir/cambiar avatar)

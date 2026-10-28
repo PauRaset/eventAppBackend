@@ -20,13 +20,10 @@ const oid = (v) => {
     return v;
   }
 };
-const isObjectId = (v) => {
-  try {
-    return mongoose.Types.ObjectId.isValid(v);
-  } catch {
-    return false;
-  }
-};
+// _id de Mongo de verdad: 24 hex (o un ObjectId). mongoose.isValid acepta
+// cualquier texto de 12 caracteres, y un uid de Firebase así se tomaba por _id.
+const isObjectId = (v) =>
+  v instanceof mongoose.Types.ObjectId || (typeof v === 'string' && /^[a-fA-F0-9]{24}$/.test(v));
 const pickUserId = (req) => req.userId || req.user?.id || req.user?._id;
 
 const syncFollowedUsersPromotionCounter = async (userId) => {
@@ -496,8 +493,15 @@ const PRIVACY_FIELDS = 'isPrivate privateProfile profilePrivate privacy';
 
 /**
  * ¿Puede quien hace la petición ver las listas (seguidores/seguidos) de `target`?
- * Perfil público: sí. Perfil privado: solo él mismo o quien le sigue.
- * `target.followers` puede venir como ids o ya populado (docs con _id).
+ * Perfil público: sí. Perfil privado: solo él mismo o quien le sigue DE VERDAD:
+ * está en los followers del perfil Y el perfil está en su following (la
+ * relación completa, la que la app enseña como "Siguiendo"). Si solo está en
+ * un lado (relación rota), NO cuenta: antes bastaba con estar en followers y
+ * alguien a quien la app mostraba "Seguir" veía las listas de un privado.
+ * Una solicitud pendiente tampoco cuenta.
+ * `target` debe venir en bruto (lean): con un documento de Mongoose los campos
+ * de privacidad fuera del esquema (privacy, privateProfile...) no se leen.
+ * `target.followers` puede venir como ids o ya populado (objetos con _id).
  */
 const canViewSocialLists = async (req, target) => {
   if (!isPrivateProfile(target)) return true;
@@ -505,8 +509,11 @@ const canViewSocialLists = async (req, target) => {
   const viewer = await resolveUserByKey(pickUserId(req));
   if (!viewer) return false;
   const viewerId = String(viewer._id);
-  if (viewerId === String(target._id)) return true;
-  return (target.followers || []).some((f) => String(f?._id ?? f) === viewerId);
+  const targetId = String(target._id);
+  if (viewerId === targetId) return true;
+  const inTheirFollowers = (target.followers || []).some((f) => String(f?._id ?? f) === viewerId);
+  const inMyFollowing = (viewer.following || []).some((f) => String(f?._id ?? f) === targetId);
+  return inTheirFollowers && inMyFollowing;
 };
 
 // Requiere auth (socialRoutes). Perfil privado: solo lo ve él mismo o quien le sigue.
@@ -518,7 +525,8 @@ exports.getFollowers = async (req, res) => {
 
     const u = await User.findById(req.params.id)
       .select(`followers ${PRIVACY_FIELDS}`)
-      .populate('followers', '_id username phoneNumber profilePicture');
+      .populate('followers', '_id username phoneNumber profilePicture')
+      .lean(); // en bruto: si no, privacy/privateProfile/profilePrivate no se leen
     if (!u) return res.status(404).json({ message: 'Usuario no encontrado' });
 
     if (!(await canViewSocialLists(req, u))) {
@@ -527,7 +535,7 @@ exports.getFollowers = async (req, res) => {
 
     // Misma forma que antes ({ _id, username, profilePicture }); username público, sin teléfono
     const followers = u.followers.map((f) => {
-      const { phoneNumber, ...pub } = sanitizePublicUser(f.toObject ? f.toObject() : f);
+      const { phoneNumber, ...pub } = sanitizePublicUser(f);
       return pub;
     });
     res.json({ count: followers.length, followers });
@@ -546,7 +554,8 @@ exports.getFollowing = async (req, res) => {
 
     const u = await User.findById(req.params.id)
       .select(`following followers ${PRIVACY_FIELDS}`)
-      .populate('following', '_id username phoneNumber profilePicture');
+      .populate('following', '_id username phoneNumber profilePicture')
+      .lean(); // en bruto: si no, privacy/privateProfile/profilePrivate no se leen
     if (!u) return res.status(404).json({ message: 'Usuario no encontrado' });
 
     if (!(await canViewSocialLists(req, u))) {
@@ -555,7 +564,7 @@ exports.getFollowing = async (req, res) => {
 
     // Misma forma que antes ({ _id, username, profilePicture }); username público, sin teléfono
     const following = u.following.map((f) => {
-      const { phoneNumber, ...pub } = sanitizePublicUser(f.toObject ? f.toObject() : f);
+      const { phoneNumber, ...pub } = sanitizePublicUser(f);
       return pub;
     });
     res.json({ count: following.length, following });
@@ -747,16 +756,38 @@ exports.removeFollower = async (req, res) => {
 // ———————————————————————————————————————————————————————————————————————
 exports.getUserStats = async (req, res) => {
   try {
-    const meId = pickUserId(req);
+    if (!isObjectId(req.params.id)) return res.status(404).json({ message: 'Usuario no encontrado' });
     const u = await User.findById(req.params.id)
-      .select('followersCount followingCount followers following');
+      .select('followersCount followingCount followers following followRequestsReceived');
     if (!u) return res.status(404).json({ message: 'Usuario no encontrado' });
+
+    // isFollowing por _id de Mongo: se resuelve antes quién consulta (el token
+    // puede traer el uid de Firebase; antes se comparaba ese uid con los _id
+    // del array y salía false aunque le siguiera). Mismo criterio que
+    // canViewSocialLists: la relación completa (en sus followers y en mi following).
+    const viewer = await resolveUserByKey(pickUserId(req));
+    const viewerId = viewer ? String(viewer._id) : null;
+    const targetId = String(u._id);
+
+    // Solicitud pendiente de quien consulta hacia este usuario (por _id de Mongo)
+    const requestPending = !!(
+      viewerId &&
+      (viewer.followRequestsSent?.some((f) => String(f) === targetId) ||
+        u.followRequestsReceived?.some((f) => String(f) === viewerId))
+    );
+    // Con solicitud pendiente todavía no le sigue
+    const isFollowing = !requestPending && !!(
+      viewerId &&
+      u.followers?.some((f) => String(f) === viewerId) &&
+      viewer.following?.some((f) => String(f) === targetId)
+    );
 
     res.json({
       followers: u.followersCount ?? u.followers?.length ?? 0,
       following: u.followingCount ?? u.following?.length ?? 0,
       attending: 0, // el front calcula el grid y puede ajustar esto
-      isFollowing: !!(meId && u.followers?.some((f) => String(f) === String(meId))),
+      isFollowing,
+      requestPending,
     });
   } catch (err) {
     console.error('[getUserStats] err', err);
