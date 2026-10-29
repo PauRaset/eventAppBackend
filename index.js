@@ -43,6 +43,8 @@ try {
   console.error('❌ No se pudo cargar ./routes/referralAnalytics (analytics deshabilitado):', e);
 }
 const { anyAuthWithId, anyAuth, ensureUserId } = require("./middlewares/authMiddleware");
+const { sessionUser } = require("./middlewares/requireOnboarding");
+const { onboardingFields } = require("./utils/onboarding");
 
 // ✅ Inicializa firebase-admin y loguea el project_id para depurar 403
 const admin = require("./middlewares/firebaseAdmin");
@@ -314,8 +316,19 @@ app.get('/api/version', (_req, res) => res.json({
   env: process.env.NODE_ENV || 'development',
   uptime: process.uptime(),
 }));
-app.get('/api/auth/me', anyAuthWithId, (req, res) => {
-  return res.json({ ok: true, user: req.user || null });
+// ⚠️ Esta ruta es la que responde GET /api/auth/me (va antes que authRoutes,
+// cuyo GET /me no llega a ejecutarse). Se añaden los campos del alta del
+// propio usuario (needsOnboarding, missingOnboarding, underage, birthDate,
+// termsAcceptedAt, termsVersion, onboardingCompletedAt) si tiene cuenta en Mongo.
+app.get('/api/auth/me', anyAuthWithId, async (req, res) => {
+  let extra = {};
+  try {
+    const u = await sessionUser(req);
+    if (u) extra = onboardingFields(u);
+  } catch (err) {
+    console.error('[GET /api/auth/me] alta:', err?.message || err);
+  }
+  return res.json({ ok: true, user: req.user ? { ...req.user, ...extra } : null });
 });
 
 // ===== DEBUG Firebase: verifica un ID token (solo en desarrollo) =====
@@ -1157,6 +1170,7 @@ const registrationRoutes = require("./routes/registrationRoutes"); // <-- MOVIDO
 const promotionsRoutes = require("./routes/promotionsRoutes");
 const notificationRoutes = require("./routes/notificationRoutes");
 const pushRoutes = require("./routes/pushRoutes");
+const configRoutes = require("./routes/configRoutes"); // GET /api/config/public (edad mínima, términos)
 
 // Compat: clientes antiguos pueden llamar /start|/request|/requests
 // Normalizamos name -> clubName y reenviamos al router en /apply sin perder body
@@ -1188,6 +1202,7 @@ app.use("/search", searchRoutes);
 app.use("/api/registration", registrationRoutes); // <-- Y montado AQUÍ
 app.use("/api/clubs", clubRoutes);
 app.use("/api/social", socialRoutes);
+app.use("/api/config", configRoutes);
 
 // Payments: endpoints para links directos de compra (compat)
 if (paymentRoutes) {

@@ -108,6 +108,8 @@ const UserClubPromotionProgress = require("../models/UserClubPromotionProgress")
 
 // Tu middleware JWT actual (export default)
 const authenticateToken = require("../middlewares/authMiddleware");
+// Alta completa + edad mínima en acciones del espectador (solo con ONBOARDING_ENFORCED=true)
+const requireOnboarding = require("../middlewares/requireOnboarding");
 
 // Inicializa firebase-admin (y permite usar admin directamente)
 require("../middlewares/firebaseAdmin");
@@ -2111,7 +2113,7 @@ router.get("/scan/:token/resolve", anyAuth, ensureUserId, (req, res) =>
   handleQrScanResolve(req, res, req.params.token, "GET /events/scan/:token/resolve")
 );
 
-router.post("/scan/:token/photo", anyAuth, ensureUserId, uploadAny.any(), async (req, res, next) => {
+router.post("/scan/:token/photo", anyAuth, ensureUserId, requireOnboarding, uploadAny.any(), async (req, res, next) => {
   try {
     const parsed = parseQrPayloadValue(req.params.token);
 
@@ -3996,9 +3998,10 @@ async function postPhotosHandler(req, res) {
 }
 
 // Acepta cualquier campo / array (evita que Flutter tenga que adivinar)
-router.post("/:id/photos", anyAuth, ensureUserId, uploadAny.any(), postPhotosHandler);
-router.post("/:id/photos/upload", anyAuth, ensureUserId, uploadAny.any(), postPhotosHandler);
-router.post("/:id/upload-photo", anyAuth, ensureUserId, uploadAny.any(), postPhotosHandler);
+// requireOnboarding antes de multer: si se bloquea, no se guarda el archivo
+router.post("/:id/photos", anyAuth, ensureUserId, requireOnboarding, uploadAny.any(), postPhotosHandler);
+router.post("/:id/photos/upload", anyAuth, ensureUserId, requireOnboarding, uploadAny.any(), postPhotosHandler);
+router.post("/:id/upload-photo", anyAuth, ensureUserId, requireOnboarding, uploadAny.any(), postPhotosHandler);
 
 /* ------------------------------------------------------------------
    GALERÍA: DELETE foto(s) (solo propietario)
@@ -4133,7 +4136,7 @@ function usableEmailForTickets(email) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e) ? e : null;
 }
 
-router.post("/:id/reserve", anyAuth, ensureUserId, reserveLimiter, async (req, res) => {
+router.post("/:id/reserve", anyAuth, ensureUserId, requireOnboarding, reserveLimiter, async (req, res) => {
   const eventId = String(req.params.id || "");
   try {
     if (!mongoose.isValidObjectId(eventId)) {
@@ -4332,7 +4335,23 @@ function updateModified(r) {
   return Number(r?.nModified ?? r?.modifiedCount ?? 0) > 0;
 }
 
-router.post("/:id/attend", anyAuth, ensureUserId, async (req, res) => {
+// /attend alterna marcar y desmarcar: el alta solo se exige para MARCAR. Quien
+// ya está en attendees puede desmarcarse siempre (aunque le falte el alta o
+// MIN_AGE haya subido).
+async function requireOnboardingToAttend(req, res, next) {
+  try {
+    const id = String(req.params.id || "");
+    if (mongoose.isValidObjectId(id) && mongoose.isValidObjectId(String(req.user?.id || ""))) {
+      const already = await Event.exists({ _id: id, attendees: new mongoose.Types.ObjectId(req.user.id) });
+      if (already) return next();
+    }
+  } catch (_) {
+    // ante la duda, se aplica el control normal
+  }
+  return requireOnboarding(req, res, next);
+}
+
+router.post("/:id/attend", anyAuth, ensureUserId, requireOnboardingToAttend, async (req, res) => {
   const eventId = req.params.id;
 
   try {

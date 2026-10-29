@@ -65,6 +65,18 @@ const userSchema = new mongoose.Schema(
 
     role: { type: String, enum: ["club", "spectator"], default: "spectator" },
 
+    // ---- Alta del espectador (POST /api/users/me/onboarding) ----
+    // PRIVADOS: solo salen en las respuestas del propio usuario. sanitizePublicUser
+    // (utils/publicName.js) los quita y ninguna ruta de edición los acepta.
+    // birthDate: 00:00 UTC del día de nacimiento; se fija una sola vez.
+    birthDate: { type: Date, default: null },
+    termsAcceptedAt: { type: Date, default: null },
+    termsVersion: { type: String, default: null }, // TERMS_VERSION aceptada
+    onboardingCompletedAt: { type: Date, default: null },
+    // Intento de alta con una edad por debajo de MIN_AGE (la fecha NO se guarda).
+    // Con esta marca el alta responde 403 underage sin aceptar otra fecha.
+    ageGateFailedAt: { type: Date, default: null },
+
     // --- Social (seguidores / seguidos) ---
     followers: {
       type: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
@@ -181,6 +193,12 @@ userSchema.index({ followersCount: 1 });
 userSchema.index({ followingCount: 1 });
 userSchema.index({ followRequestsReceived: 1 });
 userSchema.index({ followRequestsSent: 1 });
+// Username sin distinguir mayúsculas (disponibilidad / unicidad en utils/onboarding.js).
+// NO único todavía: antes hay que revisar los duplicados (scripts/findDuplicateUsernames.js).
+userSchema.index(
+  { username: 1 },
+  { name: "username_ci", collation: { locale: "en", strength: 2 } }
+);
 
 /* ----------------------------- Hooks & helpers ---------------------------- */
 

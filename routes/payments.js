@@ -1056,6 +1056,8 @@ router.post('/direct/:eventId', directStartLimiter, startDirectCheckout);
 ================================================================== */
 const mongoose = require('mongoose');
 const { anyAuth: anyAuthMw } = require('../middlewares/authMiddleware');
+// Alta completa + edad mínima (solo con ONBOARDING_ENFORCED=true). No se usa en /direct (web sin app).
+const requireOnboarding = require('../middlewares/requireOnboarding');
 
 const MAX_QTY_APP = 10;
 
@@ -1173,7 +1175,7 @@ function parseReturnUrl(raw) {
   }
 }
 
-router.post('/checkout', anyAuthMw, resolveAppUser, checkoutLimiter, async (req, res) => {
+router.post('/checkout', anyAuthMw, resolveAppUser, requireOnboarding, checkoutLimiter, async (req, res) => {
   // 1) Limpieza perezosa de reservas caducadas (no bloqueante)
   sweepExpiredReservations().catch(() => {});
 

@@ -25,6 +25,13 @@ const {
   sanitizePublicUser,
   NOT_PHONE_DERIVED_USERNAME,
 } = require("../utils/publicName");
+// Alta del espectador: estado (needsOnboarding...) y reglas del username
+const {
+  onboardingFields,
+  isUsernameTaken,
+  suggestUsernames,
+  checkUsernameChange,
+} = require("../utils/onboarding");
 const { Types: { ObjectId } } = mongoose;
 
 function isValidObjectId(v) {
@@ -207,9 +214,11 @@ router.post(
   async (req, res) => {
     try {
       let user = await resolveUserFromRequest(req);
+      let isNewUser = false;
 
       // Si no existe y venimos con Firebase, crea espectador mínimo
       if (!user && req.firebaseUser && req.firebaseUser.uid) {
+        isNewUser = true;
         const phone = req.firebaseUser.phone_number || "";
         // username neutro del _id (antes: "user_" + 6 últimos dígitos del teléfono)
         const _id = new mongoose.Types.ObjectId();
@@ -225,7 +234,11 @@ router.post(
       if (!user) return res.status(404).json({ message: "Usuario no encontrado" });
 
       const token = issueSessionToken(user);
-      return res.json({ token });
+      // needsOnboarding: la app decide justo tras el SMS si muestra el alta.
+      // isNewUser: la cuenta se ha creado en esta llamada (una cuenta ya creada
+      // por otra ruta puede tener el alta pendiente: manda needsOnboarding).
+      const { needsOnboarding } = onboardingFields(user);
+      return res.json({ token, needsOnboarding, isNewUser });
     } catch (e) {
       console.error("[POST /api/auth/exchangeFirebase]", e);
       return res.status(500).json({ message: "Error en el servidor" });
@@ -252,9 +265,11 @@ router.post("/ensure", anyAuth, ensureUserId, async (req, res) => {
 
     // Intentamos resolver el usuario actual (por JWT legacy o Firebase)
     let user = await resolveUserFromRequest(req);
+    let isNewUser = false;
 
     // Si no existe aún pero venimos con Firebase, lo creamos básico
     if (!user && req.firebaseUser && req.firebaseUser.uid) {
+      isNewUser = true;
       const phone = req.firebaseUser.phone_number || "";
       // username neutro del _id (antes: "user_" + 6 últimos dígitos del teléfono)
       const _id = new mongoose.Types.ObjectId();
@@ -272,17 +287,25 @@ router.post("/ensure", anyAuth, ensureUserId, async (req, res) => {
       return res.status(404).json({ message: "Usuario no encontrado" });
     }
 
-    // Si viene username, lo normalizamos y comprobamos que no esté usado por otro usuario
-    if (typeof username === "string" && username.trim()) {
+    // Username de un ESPECTADOR: formato del alta y único sin distinguir mayúsculas.
+    // Si no vale o está ocupado se IGNORA (sin 400: la app actual lo envía por
+    // aquí y no debe romperse). La cuenta conserva el que tenía y, si era un
+    // alias, needsOnboarding lo seguirá pidiendo. usernameRejected dice por qué.
+    let usernameRejected = null;
+    if (user.role !== "club") {
+      const check = await checkUsernameChange(user, username);
+      if (check.ok) user.username = check.value;
+      else if (check.ok === false) usernameRejected = check.body.error === "username_taken" ? "taken" : check.body.reason;
+    }
+    // Clubs: como antes, pero sin distinguir mayúsculas ("Pau" y "pau" son el mismo)
+    else if (typeof username === "string" && username.trim()) {
       const normUsername = username.trim();
-      const existing = await User.findOne({
-        username: normUsername,
-        _id: { $ne: user._id },
-      });
-      if (existing) {
-        return res
-          .status(400)
-          .json({ message: "Ese nombre de usuario ya está en uso" });
+      if (normUsername !== user.username && (await isUsernameTaken(normUsername, user._id))) {
+        return res.status(400).json({
+          message: "Ese nombre de usuario ya está en uso",
+          error: "username_taken",
+          suggestions: await suggestUsernames(normUsername, user._id),
+        });
       }
       user.username = normUsername;
     }
@@ -314,9 +337,15 @@ router.post("/ensure", anyAuth, ensureUserId, async (req, res) => {
 
     await user.save();
 
+    const status = onboardingFields(user);
     return res.json({
       message: "Usuario sincronizado correctamente",
       user,
+      isNewUser,
+      needsOnboarding: status.needsOnboarding,
+      missingOnboarding: status.missingOnboarding,
+      // null, o por qué se ignoró el username enviado: 'invalid_format' | 'reserved' | 'taken'
+      usernameRejected,
     });
   } catch (err) {
     console.error("[POST /api/auth/ensure] error:", err);
@@ -397,8 +426,13 @@ router.put("/update", anyAuth, ensureUserId, async (req, res) => {
     const user = await resolveUserFromRequest(req);
     if (!user) return res.status(404).json({ message: "Usuario no encontrado" });
 
+    // Username: solo si cambia. Espectadores: formato del alta (en minúsculas).
+    // Todos: único sin distinguir mayúsculas (409 username_taken).
+    const usernameCheck = await checkUsernameChange(user, username);
+    if (usernameCheck.ok === false) return res.status(usernameCheck.status).json(usernameCheck.body);
+    if (usernameCheck.ok) user.username = usernameCheck.value;
+
     // Campos legacy (clubs)
-    if (typeof username === 'string' && username.trim()) user.username = username.trim();
     if (typeof email === 'string' && email.trim()) user.email = cleanEmail(email);
     if (typeof entityName === 'string' && entityName.trim()) {
       user.entName = entityName.trim();

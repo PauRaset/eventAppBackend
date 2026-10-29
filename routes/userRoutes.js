@@ -19,7 +19,26 @@ const {
   NOT_PHONE_DERIVED_USERNAME,
 } = require("../utils/publicName");
 const jwt = require("jsonwebtoken");
+const rateLimit = require("express-rate-limit");
 const authenticateToken = require("../middlewares/authMiddleware");
+const { sessionUser } = require("../middlewares/requireOnboarding");
+const { getMinAge, parseBirthDate, meetsMinAge, formatBirthDate } = require("../utils/age");
+const {
+  USERNAME_RULES,
+  DISPLAY_NAME_MAX,
+  normalizeUsername,
+  usernameProblem,
+  isUsernameTaken,
+  suggestUsernames,
+  invalidUsernameBody,
+  takenBody,
+  checkUsernameChange,
+  cleanDisplayName,
+  normalizeInstagram,
+  currentTermsVersion,
+  missingOnboarding,
+  onboardingFields,
+} = require("../utils/onboarding");
 
 // Inicializa firebase-admin (igual que en eventRoutes)
 require("../middlewares/firebaseAdmin");
@@ -261,6 +280,213 @@ router.get("/me/assignable", anyAuth, ensureUserId, async (req, res) => {
 });
 
 /* -------------------------------------------------------------
+   ALTA DEL ESPECTADOR (tras el SMS)
+   - GET  /api/users/username-available?u=
+   - POST /api/users/me/onboarding
+   Reglas y estado del alta en utils/onboarding.js; edad en utils/age.js.
+------------------------------------------------------------- */
+const usernameCheckLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => `uname:${req.user.id}`,
+  handler: (req, res) => res.status(429).json({ error: "too_many_requests" }),
+});
+
+const onboardingLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => `onboarding:${req.user.id}`,
+  handler: (req, res) => res.status(429).json({ error: "too_many_requests" }),
+});
+
+/**
+ * GET /api/users/username-available?u=pau.raset
+ * 200 { available: true,  username }
+ * 200 { available: false, reason: 'taken',          suggestions: [...] }
+ * 200 { available: false, reason: 'invalid_format', rules }
+ * 200 { available: false, reason: 'reserved',       rules, suggestions: [...] }
+ * El username propio cuenta como libre. Nunca dice nada de quien lo tiene.
+ */
+router.get("/username-available", anyAuth, ensureUserId, usernameCheckLimiter, async (req, res) => {
+  try {
+    const me = await sessionUser(req);
+    if (!me) return res.status(404).json({ message: "Usuario no encontrado" });
+
+    const isClub = me.role === "club";
+    const raw = typeof req.query.u === "string" ? req.query.u : "";
+    const username = isClub ? raw.trim() : normalizeUsername(raw);
+
+    if (!isClub) {
+      const problem = usernameProblem(username);
+      if (problem === "invalid_format") {
+        return res.json({ available: false, reason: "invalid_format", rules: USERNAME_RULES });
+      }
+      if (problem === "reserved") {
+        return res.json({
+          available: false,
+          reason: "reserved",
+          rules: USERNAME_RULES,
+          suggestions: await suggestUsernames(username, me._id),
+        });
+      }
+    } else if (!username) {
+      return res.json({ available: false, reason: "invalid_format", rules: USERNAME_RULES });
+    }
+
+    if (await isUsernameTaken(username, me._id)) {
+      return res.json({ available: false, reason: "taken", suggestions: await suggestUsernames(username, me._id) });
+    }
+    return res.json({ available: true, username });
+  } catch (err) {
+    console.error("[GET /api/users/username-available] error:", err);
+    return res.status(500).json({ error: "server_error" });
+  }
+});
+
+function onboardingUserView(u) {
+  return {
+    _id: u._id,
+    id: String(u._id),
+    username: u.username,
+    displayName: u.entityName || u.entName || "",
+    instagram: u.instagram || "",
+    birthDate: formatBirthDate(u.birthDate),
+    termsAcceptedAt: u.termsAcceptedAt || null,
+    termsVersion: u.termsVersion || null,
+    onboardingCompletedAt: u.onboardingCompletedAt || null,
+  };
+}
+
+/**
+ * POST /api/users/me/onboarding
+ * Body: { username, displayName, birthDate: "YYYY-MM-DD", instagram?, acceptTerms: true }
+ * Solo son obligatorios los campos que falten (missingOnboarding); los que se
+ * envíen se validan igual. Se comprueba en este orden y, si algo falla, no se
+ * guarda nada:
+ *   400 { error: 'invalid_birth_date' }
+ *   403 { error: 'underage', minAge }          (y queda ageGateFailedAt: no puede reintentar)
+ *   400 { error: 'terms_not_accepted' }
+ *   400 { error: 'invalid_username', reason, rules }
+ *   409 { error: 'username_taken', suggestions }
+ *   400 { error: 'invalid_display_name', maxLength }
+ *   400 { error: 'invalid_instagram' }
+ *   409 { error: 'not_spectator' }             (cuentas de club: no tienen alta)
+ * 200 { ok, needsOnboarding, missingOnboarding, underage, user }
+ * Idempotente. Una birthDate ya guardada no cambia (la nueva se ignora).
+ */
+router.post("/me/onboarding", anyAuth, ensureUserId, onboardingLimiter, async (req, res) => {
+  try {
+    const me = await User.findById(req.user.id).lean();
+    if (!me) return res.status(404).json({ message: "Usuario no encontrado" });
+    if (me.role === "club") {
+      return res.status(409).json({ error: "not_spectator", message: "Las cuentas de club no tienen alta de espectador" });
+    }
+
+    const body = req.body || {};
+    const underage = () => res.status(403).json({ error: "underage", minAge: getMinAge() });
+
+    // 1) Intento de menor ya registrado: no se acepta otra fecha
+    if (me.ageGateFailedAt) return underage();
+
+    // 2) Fecha de nacimiento: la guardada manda; si no hay, la del cuerpo
+    const storedBirth = me.birthDate || null;
+    const birthDate = storedBirth || parseBirthDate(body.birthDate);
+    if (!birthDate) {
+      return res.status(400).json({ error: "invalid_birth_date", message: "Fecha de nacimiento no válida (YYYY-MM-DD)" });
+    }
+
+    // 3) Edad mínima ACTUAL
+    if (!meetsMinAge(birthDate)) {
+      if (!storedBirth) {
+        // Se registra el intento SIN guardar la fecha introducida
+        await User.updateOne(
+          { _id: me._id, birthDate: null, ageGateFailedAt: null },
+          { $set: { ageGateFailedAt: new Date() } }
+        );
+      }
+      return underage();
+    }
+
+    const missing = missingOnboarding(me);
+    const $set = {};
+
+    // 4) Términos (obligatorio aceptarlos si están pendientes o cambió TERMS_VERSION)
+    const termsPending = missing.includes("terms");
+    if (termsPending && body.acceptTerms !== true) {
+      return res.status(400).json({ error: "terms_not_accepted", message: "Debes aceptar los términos" });
+    }
+
+    // 5) Username
+    const rawUsername = typeof body.username === "string" ? body.username : "";
+    if (rawUsername.trim() && !(rawUsername.trim() === me.username && !missing.includes("username"))) {
+      const username = normalizeUsername(rawUsername);
+      const problem = usernameProblem(username);
+      if (problem) return res.status(400).json(invalidUsernameBody(problem));
+      if (await isUsernameTaken(username, me._id)) return res.status(409).json(await takenBody(username, me._id));
+      if (username !== me.username) $set.username = username;
+    } else if (missing.includes("username")) {
+      return res.status(400).json(invalidUsernameBody("invalid_format"));
+    }
+
+    // 6) Nombre visible (se guarda en entityName / entName, como /ensure)
+    if (typeof body.displayName !== "undefined" || missing.includes("displayName")) {
+      const displayName = cleanDisplayName(body.displayName, me.phoneNumber);
+      if (!displayName) {
+        return res.status(400).json({
+          error: "invalid_display_name",
+          maxLength: DISPLAY_NAME_MAX,
+          message: `El nombre debe tener entre 1 y ${DISPLAY_NAME_MAX} caracteres`,
+        });
+      }
+      $set.entityName = displayName;
+      $set.entName = displayName;
+    }
+
+    // 7) Instagram (opcional)
+    const ig = normalizeInstagram(body.instagram);
+    if (!ig) return res.status(400).json({ error: "invalid_instagram", message: "Usuario de Instagram no válido" });
+    if (ig.value) $set.instagram = ig.value;
+
+    // Guardar: todo de una vez y condicionado a que nada haya cambiado entretanto
+    const now = new Date();
+    if (!storedBirth) $set.birthDate = birthDate;
+    if (termsPending) {
+      $set.termsAcceptedAt = now;
+      $set.termsVersion = currentTermsVersion();
+    }
+    if (!me.onboardingCompletedAt) $set.onboardingCompletedAt = now;
+
+    let updated = me;
+    if (Object.keys($set).length) {
+      const filter = { _id: me._id, ageGateFailedAt: null };
+      if (!storedBirth) filter.birthDate = null;
+      updated = await User.findOneAndUpdate(filter, { $set }, { new: true }).lean();
+      if (!updated) {
+        const fresh = await User.findById(me._id).select("ageGateFailedAt").lean();
+        if (fresh?.ageGateFailedAt) return underage();
+        return res.status(409).json({ error: "conflict", message: "Tus datos han cambiado, vuelve a intentarlo" });
+      }
+    }
+
+    const status = onboardingFields(updated);
+    return res.json({
+      ok: true,
+      needsOnboarding: status.needsOnboarding,
+      missingOnboarding: status.missingOnboarding,
+      underage: status.underage,
+      user: onboardingUserView(updated),
+    });
+  } catch (err) {
+    console.error("[POST /api/users/me/onboarding] error:", err);
+    return res.status(500).json({ error: "server_error" });
+  }
+});
+
+/* -------------------------------------------------------------
    GET /api/users/me  (JWT o Firebase)
 ------------------------------------------------------------- */
 router.get("/me", anyAuth, ensureUserId, async (req, res) => {
@@ -288,6 +514,9 @@ router.get("/me", anyAuth, ensureUserId, async (req, res) => {
       locationVisibility: u.locationVisibility || u.privacySettings?.locationVisibility || "private",
       createdAt: u.createdAt,
       updatedAt: u.updatedAt,
+      // Alta: needsOnboarding, missingOnboarding, underage, birthDate ("YYYY-MM-DD"),
+      // termsAcceptedAt, termsVersion, onboardingCompletedAt (solo para el propio usuario)
+      ...onboardingFields(u),
     });
   } catch (err) {
     console.error("[GET /api/users/me] error:", err);
@@ -357,6 +586,17 @@ function sanitizeProfileUpdate(body) {
 async function updateMeHandler(req, res) {
   try {
     const update = sanitizeProfileUpdate(req.body);
+
+    // Username: solo si cambia. Espectadores: formato del alta (se guarda en
+    // minúsculas). Todos: único sin distinguir mayúsculas (409 username_taken).
+    if (typeof update.username !== "undefined") {
+      const me = await User.findById(req.user.id).select("_id role username").lean();
+      if (!me) return res.status(404).json({ message: "Usuario no encontrado" });
+      const check = await checkUsernameChange(me, update.username);
+      if (check.ok === false) return res.status(check.status).json(check.body);
+      if (check.unchanged) delete update.username;
+      else update.username = check.value;
+    }
     const user = await User.findByIdAndUpdate(req.user.id, update, { new: true }).lean();
     if (!user) return res.status(404).json({ message: "Usuario no encontrado" });
 

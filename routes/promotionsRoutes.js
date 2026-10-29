@@ -5,6 +5,8 @@ const router = express.Router();
 const promotionsController = require('../controllers/promotionsController');
 const requireFirebase = require('../middlewares/requireFirebase');
 const { anyAuthWithId } = require('../middlewares/authMiddleware');
+// Alta completa + edad mínima (solo con ONBOARDING_ENFORCED=true)
+const requireOnboarding = require('../middlewares/requireOnboarding');
 
 // ===========================
 // USER (app)
@@ -19,12 +21,12 @@ router.get('/my', requireFirebase, promotionsController.getMyPromotions);
 
 // Canjear la recompensa del nivel actual completado
 // POST /api/promotions/:clubId/redeem
-router.post('/:clubId/redeem', requireFirebase, promotionsController.redeemCurrentLevelReward);
+router.post('/:clubId/redeem', requireFirebase, requireOnboarding, promotionsController.redeemCurrentLevelReward);
 router.get('/:clubId/levels', requireFirebase, promotionsController.getClubLevelsForUser);
 
 // Crear un claim (subir prueba: foto/qr/text) para una misión
 // POST /api/promotions/:clubId/claims
-router.post('/:clubId/claims', requireFirebase, promotionsController.createClaim);
+router.post('/:clubId/claims', requireFirebase, requireOnboarding, promotionsController.createClaim);
 
 // Cancelar un claim propio (opcional)
 // POST /api/promotions/claims/:claimId/cancel

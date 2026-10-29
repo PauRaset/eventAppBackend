@@ -85,7 +85,8 @@ function publicStoredName(name, userId) {
 /**
  * Para objetos de usuario populados que se devuelven tal cual (createdBy,
  * actor...): copia con username / displayName públicos y SIN datos privados:
- * teléfono, email, firebaseUid, listas de seguidores/seguidos ni solicitudes.
+ * teléfono, email, firebaseUid, listas de seguidores/seguidos, solicitudes ni
+ * datos del alta (fecha de nacimiento, términos).
  */
 function sanitizePublicUser(u) {
   if (!u || typeof u !== 'object') return u;
@@ -97,6 +98,7 @@ function sanitizePublicUser(u) {
   for (const k of [
     'phoneNumber', 'phone', 'email', 'firebaseUid', 'password',
     'followers', 'following', 'followRequestsReceived', 'followRequestsSent',
+    'birthDate', 'termsAcceptedAt', 'termsVersion', 'onboardingCompletedAt', 'ageGateFailedAt',
   ]) delete out[k];
   return out;
 }
